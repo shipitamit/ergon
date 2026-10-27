@@ -1,0 +1,217 @@
+{
+  "version": 2,
+  "nodes": [
+    {
+      "id": "in",
+      "type": "input",
+      "x": 40,
+      "y": 300,
+      "config": {
+        "message": "Where is my order #4821? It was supposed to arrive yesterday."
+      }
+    },
+    {
+      "id": "router",
+      "type": "router",
+      "x": 250,
+      "y": 300,
+      "config": {
+        "name": "triage",
+        "labels": "order_status, returns, technical",
+        "instruction": "Classify this customer message into exactly one category: order_status (tracking, delivery, where-is-my-order), returns (refunds, exchanges, return a product), or technical (site errors, login, checkout problems). Reply with only the category word.",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "a_status",
+      "type": "agent",
+      "x": 520,
+      "y": 120,
+      "config": {
+        "name": "order_status",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "baseUrl": "",
+        "system": "You are an order-status specialist for an online store. Use the lookup_order tool to fetch live tracking and delivery info by order number, then answer warmly and concisely. If the customer hasn't given an order number, ask for it. Never invent tracking details \u2014 only report what the tool returns.",
+        "mode": "execute",
+        "customMode": "",
+        "maxIterations": 6,
+        "compaction": false,
+        "tokenBudget": 30000,
+        "todo": true,
+        "memory": true,
+        "files": false,
+        "workingDir": "./workspace",
+        "allowInternet": true,
+        "approvalMode": "heuristic",
+        "alwaysAllow": "",
+        "skillsDir": "",
+        "subagents": false,
+        "shell": false,
+        "otel": true,
+        "loopEnabled": false,
+        "loopMarker": "TASK_COMPLETE",
+        "maxRounds": 3
+      }
+    },
+    {
+      "id": "t_lookup",
+      "type": "customtool",
+      "x": 800,
+      "y": 120,
+      "config": {
+        "name": "lookup_order",
+        "description": "Look up live order status and tracking by order number.",
+        "mode": "http",
+        "js": "",
+        "url": "https://api.yourstore.com/orders",
+        "httpMethod": "GET",
+        "headers": "Authorization: Bearer ${STORE_API_TOKEN}"
+      }
+    },
+    {
+      "id": "a_returns",
+      "type": "agent",
+      "x": 520,
+      "y": 300,
+      "config": {
+        "name": "returns",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "baseUrl": "",
+        "system": "You are a returns specialist. First call check_return_eligibility with the order number. If eligible, explain the policy and call create_return_label to issue a prepaid label. If not eligible, explain why kindly and offer alternatives. Always confirm the item and reason before creating a label.",
+        "mode": "execute",
+        "customMode": "",
+        "maxIterations": 6,
+        "compaction": false,
+        "tokenBudget": 30000,
+        "todo": true,
+        "memory": true,
+        "files": false,
+        "workingDir": "./workspace",
+        "allowInternet": true,
+        "approvalMode": "interactive",
+        "alwaysAllow": "check_return_eligibility",
+        "skillsDir": "",
+        "subagents": false,
+        "shell": false,
+        "otel": true,
+        "loopEnabled": false,
+        "loopMarker": "TASK_COMPLETE",
+        "maxRounds": 3
+      }
+    },
+    {
+      "id": "t_elig",
+      "type": "customtool",
+      "x": 800,
+      "y": 250,
+      "config": {
+        "name": "check_return_eligibility",
+        "description": "Check whether an order is within the return window and eligible.",
+        "mode": "http",
+        "js": "",
+        "url": "https://api.yourstore.com/returns/eligibility",
+        "httpMethod": "GET",
+        "headers": "Authorization: Bearer ${STORE_API_TOKEN}"
+      }
+    },
+    {
+      "id": "t_label",
+      "type": "customtool",
+      "x": 800,
+      "y": 360,
+      "config": {
+        "name": "create_return_label",
+        "description": "Issue a prepaid return shipping label for an order (mutating, costs money).",
+        "mode": "http",
+        "js": "",
+        "url": "https://api.yourstore.com/returns/label",
+        "httpMethod": "POST",
+        "headers": "Authorization: Bearer ${STORE_API_TOKEN}"
+      }
+    },
+    {
+      "id": "a_tech",
+      "type": "agent",
+      "x": 520,
+      "y": 480,
+      "config": {
+        "name": "technical",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "baseUrl": "",
+        "system": "You are a technical support specialist for the store's website. Help with checkout errors, login issues, and site bugs. Give clear step-by-step guidance. If the issue looks like a genuine outage or you can't resolve it, tell the customer you're escalating to engineering and summarize the problem for the ticket.",
+        "mode": "execute",
+        "customMode": "",
+        "maxIterations": 6,
+        "compaction": false,
+        "tokenBudget": 30000,
+        "todo": true,
+        "memory": true,
+        "files": false,
+        "workingDir": "./workspace",
+        "allowInternet": true,
+        "approvalMode": "heuristic",
+        "alwaysAllow": "",
+        "skillsDir": "",
+        "subagents": false,
+        "shell": false,
+        "otel": true,
+        "loopEnabled": false,
+        "loopMarker": "TASK_COMPLETE",
+        "maxRounds": 3
+      }
+    },
+    {
+      "id": "out",
+      "type": "output",
+      "x": 800,
+      "y": 480,
+      "config": {}
+    }
+  ],
+  "edges": [
+    {
+      "kind": "flow",
+      "from": "in",
+      "to": "router"
+    },
+    {
+      "kind": "dispatch",
+      "from": "router",
+      "to": "a_status"
+    },
+    {
+      "kind": "dispatch",
+      "from": "router",
+      "to": "a_returns"
+    },
+    {
+      "kind": "dispatch",
+      "from": "router",
+      "to": "a_tech"
+    },
+    {
+      "kind": "tool",
+      "from": "a_status",
+      "to": "t_lookup"
+    },
+    {
+      "kind": "tool",
+      "from": "a_returns",
+      "to": "t_elig"
+    },
+    {
+      "kind": "tool",
+      "from": "a_returns",
+      "to": "t_label"
+    },
+    {
+      "kind": "flow",
+      "from": "router",
+      "to": "out"
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+# ── Python (sdk/) ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# ── Node (studio/) ──
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+# ── secrets & keys (NEVER commit) ──
+.env
+.env.*
+!.env.example
+!**/.env.example
+.ergon-settings.json
+.ergon-settings.json.*
+**/.ergon-settings.json*
+*.key
+*.pem
+
+# ── runtime / generated (never commit) ──
+sessions/               # SDK session output (history.json, events.jsonl)
+workspace/              # agent working dirs (files/shell tools)
+backups/                # DB backup snapshots
+*.pre-restore-*
+*.log
+# SQLite (accounts tier) — any location
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-*
+
+# ── generated single-file artifact (run: node studio/scripts/build-artifact.mjs) ──
+/ergon-studio.jsx
+
+# ── editor / OS ──
+.DS_Store
+.idea/
+.vscode/
+*.swp

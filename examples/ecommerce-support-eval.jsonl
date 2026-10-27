@@ -1,0 +1,5 @@
+{"input": "Where is my order #4821?", "expected": "4821"}
+{"input": "I need to return these shoes, they don't fit", "expected": "return"}
+{"input": "The checkout page throws an error when I click pay", "expected": "checkout"}
+{"input": "Can I get a refund for order 5567?", "expected": "return"}
+{"input": "My package says delivered but I never got it", "expected": "delivery"}

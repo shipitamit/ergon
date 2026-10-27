@@ -1,0 +1,33 @@
+feat: Studio experience & integrations (v0.3.0)
+
+Add triggers, a managed connector/connection store with OAuth and a runner-side
+resolver, live collaboration, and a full builder-experience pass; consolidate the
+changelog and tidy repo hygiene.
+
+Integrations
+- Triggers: webhook (tokenised URL) and cron schedules (UTC) via an in-process
+  scheduler; a trigger runs on the harness's deployed runner.
+- Connector catalog (~14) + per-org connection store: credentials sealed at rest
+  (AES-256-GCM), secret-free reads, reusable across harnesses.
+- Connection OAuth 2.0 (PKCE + token auto-refresh) with paste-a-token fallback,
+  and a key-authenticated resolve endpoint so a runner fetches the live credential
+  at run time — never written into the harness or the Python export.
+
+Collaboration
+- Live cursors, node-anchored comments, and capped version history with a visual
+  diff and one-click restore.
+
+Builder UX
+- Canvas table-stakes, multi-select/copy/paste/auto-layout, ⌘K command palette,
+  insert-node-on-edge, sticky notes, per-node/partial runs, WCAG AA pass, light theme.
+
+Fixes
+- Router/conditional now executes the branch it selects.
+- Remove a duplicate top-level declaration that broke the Studio build.
+
+Docs/hygiene
+- Clarify the multi-provider story (README + .env.example); fold 42 per-feature
+  dev notes into CHANGELOG.md; gitignore the generated single-file artifact.
+
+Validated: Studio 258 assertions + 95 HTTP checks; SDK 187 tests — all green.
+

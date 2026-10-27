@@ -1,0 +1,97 @@
+# Ergon Studio — full production stack: app + Postgres (pgvector) + Valkey.
+# (Valkey is the BSD-licensed, Redis-compatible cache; see the valkey service note.)
+#
+#   docker compose up --build
+#
+# The app auto-selects its scale backends from the env below: DATABASE_URL →
+# Postgres data layer, REDIS_URL → shared rate limiting. Omit them and the app
+# falls back to single-instance SQLite + in-memory limiting (no db/redis needed).
+#
+# Set ANTHROPIC_API_KEY (and any other provider keys) in a .env file next to this
+# compose file, or via your orchestrator's secrets — do not commit them.
+
+services:
+  studio:
+    build: ./studio
+    ports:
+      - "8787:8787"
+    environment:
+      - NODE_ENV=production
+      - PORT=8787
+      - DATABASE_URL=postgres://ergon:ergon@db:5432/ergon
+      - REDIS_URL=redis://valkey:6379
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - SESSION_SECRET=${SESSION_SECRET:-change-me}
+    volumes:
+      # persist DB snapshots across container recreation; ship these off-box
+      # (npm run backup writes here) for real durability
+      - ergon-backups:/app/backups
+    depends_on:
+      db:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8787/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+
+  db:
+    # pgvector image so the RAG PgVectorStore works out of the box
+    image: pgvector/pgvector:pg16
+    environment:
+      - POSTGRES_USER=ergon
+      - POSTGRES_PASSWORD=ergon
+      - POSTGRES_DB=ergon
+    volumes:
+      - ergon-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ergon"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Valkey — the Linux Foundation's BSD-licensed, Redis-protocol-compatible fork.
+  # Used instead of the Redis image so the default stack carries no SSPL/RSAL
+  # licensing question (see the README's Deployment → Licensing note). The app's
+  # rate limiter speaks the standard protocol, so REDIS_URL points here unchanged;
+  # swap back to `image: redis:7-alpine` if you specifically want Redis.
+  valkey:
+    image: valkey/valkey:8-alpine
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Serve a single harness as an HTTP endpoint (REST + SSE). Opt-in — it needs a
+  # harness graph, so it only starts under its profile:
+  #   docker compose --profile serve up --build serve
+  # Put your harness next to this file as harness.json (or change the mount),
+  # and set ERGON_SERVE_KEY to require a bearer token on the run routes.
+  serve:
+    build: ./sdk
+    profiles: ["serve"]
+    ports:
+      - "8900:8900"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ERGON_SERVE_KEY=${ERGON_SERVE_KEY:-}
+    volumes:
+      - ./harness.json:/app/harness.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8900/readyz').status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  ergon-db:
+  ergon-backups:

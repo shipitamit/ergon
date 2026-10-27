@@ -1,0 +1,14 @@
+node_modules
+dist
+.env
+
+ergon.db
+ergon.db-*
+
+# provider keys saved from the UI (encrypted, but never commit them)
+.ergon-settings.json
+.ergon-settings.json.*
+
+# backup snapshots (keep out of the repo/image)
+backups/
+*.pre-restore-*
