@@ -15,10 +15,11 @@ import { nextFireAfter } from "./cron.mjs";
 const nowMs = () => Date.now();
 
 // Fire one trigger. Returns { ok, status, body, runId, reason }.
-export async function fireTrigger(db, trigger, input = "", { forward = forwardRun, now = nowMs } = {}) {
+export async function fireTrigger(db, trigger, input = "", { forward = forwardRun, now = nowMs, noAdvance = false } = {}) {
   const t0 = now();
-  // schedule triggers advance to their next slot regardless of outcome
-  const advance = trigger.type === "schedule" && trigger.cron
+  // schedule triggers advance to their next slot regardless of outcome — unless
+  // the caller already advanced it at claim time (the durable scheduler does).
+  const advance = (!noAdvance && trigger.type === "schedule" && trigger.cron)
     ? { nextFireAt: nextFireAfter(trigger.cron, t0) } : {};
 
   const dep = await db.activeDeploymentForHarness(trigger.harnessId);
@@ -49,9 +50,27 @@ export async function fireTrigger(db, trigger, input = "", { forward = forwardRu
   return { ok, status: out.status, body: out.body, runId };
 }
 
-// Fire every schedule trigger that is due right now. Returns how many fired.
+// Fire every schedule trigger that is due right now, durably and coordinated.
+// Each due slot is atomically *claimed* (compare-and-swap on next_fire_at) before
+// firing, so overlapping ticks and multiple instances never double-fire, and the
+// claim advances the schedule so a crash after claim loses at most that one slot
+// (not the whole schedule). A durable trigger_fires record is written per slot.
+// Falls back to the legacy due+fire path if the backend predates claiming.
 export async function scheduleTick(db, { forward = forwardRun, now = nowMs } = {}) {
   let fired = 0;
+  if (typeof db.claimDueScheduleTriggers === "function") {
+    let claimed = [];
+    try { claimed = await db.claimDueScheduleTriggers(now()); } catch { return 0; }
+    for (const c of claimed) {
+      try {
+        const r = await fireTrigger(db, c.trigger, c.trigger.payload || "", { forward, now, noAdvance: true });
+        if (db.recordFireResult) await db.recordFireResult(c.fireId, { status: r.ok ? "ok" : (r.reason || "error"), runId: r.runId });
+        fired++;
+      } catch { /* a bad trigger must not stall the loop */ }
+    }
+    return fired;
+  }
+  // legacy path (no claiming): single-instance only
   let due = [];
   try { due = await db.dueScheduleTriggers(now()); } catch { return 0; }
   for (const t of due) {

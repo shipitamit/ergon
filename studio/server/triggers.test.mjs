@@ -90,6 +90,67 @@ await test("scheduleTick fires only due schedule triggers and advances them", as
   assert.ok(after.nextFireAt > Date.now(), "next fire pushed into the future");
 });
 
+// ── durable, coordinated scheduler ──
+await test("atomic claim: two concurrent claims of the same due slot — only one wins (no double-fire)", () => {
+  const sched = db.createTrigger(u.id, h.id, { type: "schedule", cron: "*/5 * * * *", payload: "p" });
+  // force it due now
+  db.markTriggerFired(sched.id, { firedAt: Date.now(), status: "ok", nextFireAt: Date.now() - 1000 });
+  const slot = db.listTriggers(h.id, u.id).find((t) => t.id === sched.id).nextFireAt;
+  const a = db.claimDueScheduleTriggers(Date.now());
+  const b = db.claimDueScheduleTriggers(Date.now());   // second worker / overlapping tick
+  const claimedA = a.filter((c) => c.trigger.id === sched.id);
+  const claimedB = b.filter((c) => c.trigger.id === sched.id);
+  assert.equal(claimedA.length, 1, "first claim gets the slot");
+  assert.equal(claimedB.length, 0, "second claim gets nothing — already claimed");
+  assert.equal(claimedA[0].scheduledFor, slot, "claim covers the exact due slot");
+  const after = db.listTriggers(h.id, u.id).find((t) => t.id === sched.id);
+  assert.ok(after.nextFireAt > Date.now(), "slot advanced at claim time");
+});
+
+await test("a durable fire record is written per claimed slot, recorded on completion", () => {
+  const sched = db.createTrigger(u.id, h.id, { type: "schedule", cron: "*/5 * * * *", payload: "x" });
+  db.markTriggerFired(sched.id, { firedAt: Date.now(), status: "ok", nextFireAt: Date.now() - 1000 });
+  const [claim] = db.claimDueScheduleTriggers(Date.now()).filter((c) => c.trigger.id === sched.id);
+  assert.ok(claim && claim.fireId, "claimed with a fire id");
+  let fires = db.listTriggerFires(sched.id, u.id);
+  assert.equal(fires.length, 1);
+  assert.equal(fires[0].status, "claimed");
+  db.recordFireResult(claim.fireId, { status: "ok", runId: "run_abc" });
+  fires = db.listTriggerFires(sched.id, u.id);
+  assert.equal(fires[0].status, "ok");
+  assert.equal(fires[0].run_id, "run_abc");
+});
+
+await test("scheduleTick uses the durable claim path: fires once, records the run, advances", async () => {
+  const sched = db.createTrigger(u.id, h.id, { type: "schedule", cron: "*/5 * * * *", payload: "y" });
+  db.markTriggerFired(sched.id, { firedAt: Date.now(), status: "ok", nextFireAt: Date.now() - 1000 });
+  db.createDeployment(orgId, u.id, { slug: "sched-dep", harnessId: h.id, targetUrl: "https://runner.example" });
+  const fakeForward = async () => ({ status: 200, kind: "ok", body: { text: "DONE" }, usage: {} });
+  const n = await scheduleTick(db, { forward: fakeForward });
+  assert.ok(n >= 1, "fired at least one");
+  // a second tick immediately after finds nothing due (slot already advanced)
+  const n2 = await scheduleTick(db, { forward: fakeForward });
+  const firesThisTrigger = db.listTriggerFires(sched.id, u.id);
+  assert.equal(firesThisTrigger.length, 1, "exactly one durable fire for this slot (no double-fire across ticks)");
+  assert.equal(firesThisTrigger[0].status, "ok");
+  assert.ok(firesThisTrigger[0].run_id, "the fire recorded its run id");
+  const after = db.listTriggers(h.id, u.id).find((t) => t.id === sched.id);
+  assert.ok(after.nextFireAt > Date.now(), "advanced into the future");
+});
+
+await test("catch-up: a schedule whose slot passed while 'down' is claimed on the next tick", () => {
+  const sched = db.createTrigger(u.id, h.id, { type: "schedule", cron: "0 * * * *", payload: "z" });
+  db.markTriggerFired(sched.id, { firedAt: Date.now(), status: "ok", nextFireAt: Date.now() - 3600_000 });  // an hour overdue
+  const claimed = db.claimDueScheduleTriggers(Date.now()).filter((c) => c.trigger.id === sched.id);
+  assert.equal(claimed.length, 1, "overdue slot is caught up");
+});
+
+await test("fires history is access-scoped", () => {
+  const sched = db.listTriggers(h.id, u.id).find((t) => t.type === "schedule");
+  const other = db.createUser("sch-out@x.com", "password1");
+  assert.throws(() => db.listTriggerFires(sched.id, other.id));
+});
+
 await test("delete removes a trigger", () => {
   const wh = db.listTriggers(h.id, u.id).find((t) => t.type === "webhook");
   db.deleteTrigger(u.id, wh.id);

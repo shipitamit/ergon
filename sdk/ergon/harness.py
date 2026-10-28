@@ -22,6 +22,8 @@ returns a clear placeholder so the run still completes.
 from __future__ import annotations
 
 import json
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -162,43 +164,119 @@ class Harness:
         return [self.nodes[i] for i in ids if i in self.nodes and self.nodes[i]["type"] == "agent"]
 
     # ── execution: walk the flow, dispatching to SDK helpers ──
-    def run(self, task: Optional[str] = None) -> AgentResult:
+    def run(self, task: Optional[str] = None, *, store: Any = None,
+            run_id: Optional[str] = None, resume: bool = False) -> AgentResult:
+        """Walk the flow and return the final AgentResult.
+
+        Durable execution (optional): pass `store` (a CheckpointStore or a
+        directory path) to persist each node's output as it completes. If the
+        run crashes, call again with the same `store` + `run_id` and
+        `resume=True`: completed nodes return their stored output instead of
+        re-executing (no duplicate model calls or tool side-effects), and the
+        walk continues from the frontier. Without a store, behavior is unchanged.
+        """
         from .usage import Usage
+        from . import durable as _d
+
+        store = _d.resolve_store(store)
         inp = next((n for n in self.nodes.values() if n["type"] == "input"), None)
         if inp is None and task is None:
             raise ValueError("Harness has no Input node; pass task=... explicitly.")
-        payload = task if task is not None else inp.get("config", {}).get("message", "")
+        task_text = task if task is not None else inp.get("config", {}).get("message", "")
 
-        cur = inp if inp is not None else None
+        # ── durable state (only when a store is given) ──
+        state = None
+        if store is not None:
+            run_id = run_id or f"run_{uuid.uuid4().hex[:12]}"
+            fp = _d.graph_fingerprint(self.nodes, self.edges)
+            if resume:
+                state = store.load(run_id)
+                if state is None:
+                    raise ValueError(f"resume=True but no checkpoint for run_id={run_id!r}.")
+                if state.get("fingerprint") != fp:
+                    raise ValueError("Cannot resume: the harness graph changed since this run "
+                                     f"started (run_id={run_id!r}). Start a fresh run.")
+                if state.get("status") == _d.STATUS_DONE:
+                    done = state["completed"].get(state["order"][-1]) if state.get("order") else None
+                    r = AgentResult(text=state.get("payload", ""))
+                    r.usage = _d.usage_from_jsonable(done.get("usage") if done else None)
+                    return r
+            else:
+                state = _d.new_state(run_id, fp, task_text)
+                store.save(run_id, state)
+
+        payload = task_text
         result: Optional[AgentResult] = None
         total = Usage()
         seen = set()
+        # On resume, rebuild the accumulated total + payload from completed nodes.
+        if state is not None and state.get("completed"):
+            for nid in state.get("order", []):
+                rec = state["completed"].get(nid)
+                if rec is None:
+                    continue
+                total.merge(_d.usage_from_jsonable(rec.get("usage")))
+                payload = rec.get("text", payload)
+
+        cur = inp if inp is not None else None
         if cur is None:
-            cur = next((n for n in self.nodes.values() if n["type"] == "agent"), None)
-            node = cur
+            node = next((n for n in self.nodes.values() if n["type"] == "agent"), None)
         else:
             node = self._next_flow(cur["id"])
 
-        while node is not None and node["id"] not in seen:
-            seen.add(node["id"])
-            t = node["type"]
-            if t == "agent":
-                result = self._run_agent_node(node, payload)
-            elif t == "router":
-                result = self._run_router(node, payload)
-            elif t == "parallel":
-                result = self._run_parallel(node, payload)
-            elif t == "output":
-                break
-            else:
-                node = self._next_flow(node["id"]); continue
-            total.merge(result.usage)          # accumulate across every flow step
-            payload = result.text
-            node = self._next_flow(node["id"])
+        try:
+            while node is not None and node["id"] not in seen:
+                seen.add(node["id"])
+                nid, t = node["id"], node["type"]
 
-        if result is None:
+                # idempotent replay: a node already completed in a prior attempt
+                # returns its stored output; it is not executed again.
+                if state is not None and nid in state.get("completed", {}):
+                    payload = state["completed"][nid].get("text", payload)
+                    node = self._next_flow(nid); continue
+
+                if t == "agent":
+                    result = self._run_agent_node(node, payload)
+                elif t == "router":
+                    result = self._run_router(node, payload)
+                elif t == "parallel":
+                    result = self._run_parallel(node, payload)
+                elif t == "output":
+                    break
+                else:
+                    node = self._next_flow(nid); continue
+
+                total.merge(result.usage)      # accumulate across every flow step
+                payload = result.text
+
+                if state is not None:          # persist this node's output durably
+                    state["completed"][nid] = {"text": result.text,
+                                               "usage": _d.usage_to_jsonable(result.usage),
+                                               "at": time.time()}
+                    state["order"].append(nid)
+                    state["payload"] = payload
+                    state["updated_at"] = time.time()
+                    store.save(run_id, state)
+
+                node = self._next_flow(nid)
+        except Exception as e:
+            if state is not None:
+                state["status"] = _d.STATUS_ERROR
+                state["error"] = str(e)
+                state["updated_at"] = time.time()
+                store.save(run_id, state)
+            raise
+
+        if result is None and not (state and state.get("completed")):
             raise ValueError("Flow produced no result — is an Agent connected to the Input?")
+        if result is None:                     # everything was replayed from the store
+            result = AgentResult(text=payload)
         result.usage = total                   # final result reflects the whole flow
+        if state is not None:
+            state["status"] = _d.STATUS_DONE
+            state["payload"] = result.text
+            state["updated_at"] = time.time()
+            store.save(run_id, state)
         return result
 
     # ── streaming execution: same flow walk, JSON-serializable progress events ──

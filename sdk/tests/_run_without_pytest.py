@@ -180,10 +180,12 @@ def main():
         "tests.test_retry_and_errors",
         "tests.test_mcp",
         "tests.test_rag",
+        "tests.test_rag_adapters",
         "tests.test_router",
         "tests.test_flows_control",
         "tests.test_checkpoints",
         "tests.test_connections",
+        "tests.test_durable",
     ]
     total_p = total_f = 0
     all_failures = []

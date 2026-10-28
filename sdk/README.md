@@ -571,6 +571,38 @@ Checkpoints are redacted on disk like the rest of the session, and `resume_from`
 raises if none exist (enable `checkpoints=True` first). In the Studio, the
 toggle lives in an agent's Advanced tab and exports to `checkpoints=True`.
 
+## Durable flow execution
+
+Per-agent checkpoints resume a single agent. For a **multi-node harness**, pass a
+`store` to `Harness.run()` and the whole flow becomes durable: each node's output
+is persisted as it completes, so a crash (or a process restart) resumes from the
+last completed node instead of the Input. Already-completed nodes return their
+stored output — they are **not re-executed**, so there are no duplicate model
+calls or tool side-effects.
+
+```python
+from ergon import load_harness, FileCheckpointStore   # or SQLite / Memory stores
+
+h = load_harness("harness.json")
+store = FileCheckpointStore("./.runs")                 # durable across restarts
+
+h.run("process order 12345", store=store, run_id="order-12345")          # crashes at node 3
+# …new process, same store…
+h.run("process order 12345", store=store, run_id="order-12345", resume=True)  # finishes from node 3
+```
+
+- **Stores:** `FileCheckpointStore(dir)` (atomic JSON per run), `SQLiteCheckpointStore(path)`
+  (a shared path lets a *different* process pick up an interrupted run), and
+  `MemoryCheckpointStore()` (tests / ephemeral). A plain directory path works too:
+  `h.run(..., store="./.runs")`.
+- **Resume guard:** a run carries a fingerprint of the graph; resuming into an edited
+  harness is refused rather than silently misaligned. Resuming a finished run just
+  returns its result without executing anything.
+- **Scope:** single-runner durable execution with crash recovery. Distributed
+  exactly-once across a cluster (leases/fencing) and a durable trigger scheduler are
+  not part of this — a shared store gets you cross-process resume, not cluster
+  consensus.
+
 ## Retries & typed errors
 
 Provider calls are retried automatically on transient failures — rate limits
@@ -632,24 +664,43 @@ agent = Agent("research", tools=[retrieve_tool(kb)],
               system="Use `retrieve` to ground answers; cite sources.")
 ```
 
-Both halves are swappable, so you can run it fully locally or on your own
-Postgres, with no lock-in:
+Both halves are swappable, so you can run it fully locally or against a managed
+service, with no lock-in:
 - **Embeddings** — `OpenAIEmbedder` (any OpenAI-compatible endpoint, incl. local
-  Ollama via `base_url`), or your own `Embedder`. A dependency-free `FakeEmbedder`
-  runs the whole path offline for tests/local use.
-- **Vector store** — `InMemoryStore` (cosine, no deps) by default, or
-  `PgVectorStore(dsn="postgres://…")` to persist in Postgres via pgvector (reuses
-  the same database as the Studio accounts tier). The table is created on first
-  use; search uses pgvector's `<=>` cosine-distance operator.
+  Ollama via `base_url`), `CohereEmbedder`, `VoyageEmbedder`, or your own
+  `Embedder`. A dependency-free `FakeEmbedder` runs the whole path offline for
+  tests/local use. `make_embedder("cohere", api_key=…)` builds one by name
+  (`openai`, `ollama`, `cohere`, `voyage`, `fake`).
+- **Vector store** — `InMemoryStore` (cosine, no deps) by default, or a managed
+  store: `PgVectorStore(dsn="postgres://…")`, `QdrantStore(url=…)`,
+  `ChromaStore(url=…)`, `PineconeStore(index_host=…, api_key=…)`,
+  `WeaviateStore(url=…)`, `MilvusStore(url=…)`.
+  `make_vector_store("qdrant", url=…)` builds one by name (`memory`, `pgvector`,
+  `qdrant`, `chroma`, `pinecone`, `weaviate`, `milvus`). The managed adapters
+  talk plain REST through an **injectable HTTP transport** that defaults to the
+  standard library — no vendor SDK and no `requests` needed.
 
-`KnowledgeBase.add_texts()` chunks (overlapping windows), embeds, and stores;
+### Ingestion
+
+`KnowledgeBase.add_texts()` chunks (overlapping windows), embeds, and stores. For
+files and web pages, the loaders do the reading and attach a `source` for
+citation:
+
+```python
+kb.add_file("docs/guide.md")              # .txt .md .csv/.tsv .pdf (lazy pypdf)
+kb.add_url("https://example.com/post")    # HTML stripped to text
+kb.add_path("docs/")                       # every supported file in a folder
+```
+
 `retrieve_tool(kb, k=4)` is safe (read-only), returning the top-k passages with
 scores and source tags. Extras: `pip install ergon[rag]` (embeddings) and
 `ergon[pgvector]` (Postgres).
 
-The retrieval *logic* is unit-tested offline against a deterministic fake
-embedder and a fake database. Real embedding quality and a live pgvector database
-are not exercised in this build — validate relevance with real data first.
+Every adapter is **unit-tested offline** against a deterministic fake embedder, a
+fake database, and a fake HTTP transport, so chunking, ranking, the request
+shapes and the response parsing are all exercised with no network. Real embedding
+quality and a live vector database are not exercised in this build — validate
+relevance against the real services before you rely on them.
 
 ## MCP (Model Context Protocol)
 

@@ -260,6 +260,37 @@ class KnowledgeBase:
         self.store.add(all_chunks)
         return len(all_chunks)
 
+    def add_file(self, path: str, metadata: Optional[Dict[str, Any]] = None) -> int:
+        """Load a file (text/markdown/csv/pdf), chunk, embed, and store it.
+
+        The file path is recorded as `source` in the chunk metadata so retrieved
+        passages can be cited. See `ergon.loaders` for the format handling.
+        """
+        from .loaders import load_file
+        text = load_file(path)
+        md = {"source": str(path), **(metadata or {})}
+        return self.add_texts([text], md)
+
+    def add_url(self, url: str, metadata: Optional[Dict[str, Any]] = None, *,
+                fetch: Optional[Callable[[str], str]] = None) -> int:
+        """Fetch a URL (HTML stripped to text), chunk, embed, and store it.
+
+        `fetch(url) -> markup` is injectable for offline use/testing.
+        """
+        from .loaders import load_url
+        text = load_url(url, http_get=fetch)
+        md = {"source": url, **(metadata or {})}
+        return self.add_texts([text], md)
+
+    def add_path(self, directory: str, metadata: Optional[Dict[str, Any]] = None, *,
+                 recursive: bool = True) -> int:
+        """Ingest every supported file under a directory. Returns total chunks."""
+        from .loaders import iter_files
+        total = 0
+        for path in iter_files(directory, recursive=recursive):
+            total += self.add_file(path, metadata)
+        return total
+
     def search(self, query: str, k: int = 4) -> List[Tuple[Chunk, float]]:
         qv = self.embedder.embed([query])[0]
         return self.store.search(qv, k)

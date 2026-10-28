@@ -231,6 +231,7 @@ CREATE TABLE IF NOT EXISTS triggers (
   payload       TEXT,                       -- schedule: the input sent on each fire
   enabled       INTEGER NOT NULL DEFAULT 1,
   next_fire_at  INTEGER,                    -- schedule: next due time (ms)
+  last_claimed_at INTEGER,                   -- schedule: when a worker last claimed a due slot
   last_fired_at INTEGER,
   last_status   TEXT,
   fire_count    INTEGER NOT NULL DEFAULT 0,
@@ -240,6 +241,21 @@ CREATE TABLE IF NOT EXISTS triggers (
 CREATE INDEX IF NOT EXISTS idx_triggers_harness ON triggers (harness_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_triggers_token ON triggers (token);
 CREATE INDEX IF NOT EXISTS idx_triggers_due ON triggers (type, enabled, next_fire_at);
+
+CREATE TABLE IF NOT EXISTS trigger_fires (
+  id            TEXT PRIMARY KEY,
+  trigger_id    TEXT NOT NULL,
+  org_id        TEXT,
+  scheduled_for INTEGER,              -- the slot this fire covers (for idempotency)
+  fired_at      INTEGER,
+  status        TEXT NOT NULL DEFAULT 'claimed',
+  run_id        TEXT,
+  created_at    INTEGER NOT NULL
+);
+-- one durable fire record per (trigger, scheduled slot): a second worker that
+-- races to the same slot hits this and does not double-fire.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trigger_fires_occurrence ON trigger_fires (trigger_id, scheduled_for);
+CREATE INDEX IF NOT EXISTS idx_trigger_fires_trigger ON trigger_fires (trigger_id, created_at);
 
 CREATE TABLE IF NOT EXISTS connections (
   id           TEXT PRIMARY KEY,
@@ -530,6 +546,42 @@ export function markTriggerFired(triggerId, { firedAt = now(), status = "ok", ne
   } else {
     db.prepare("UPDATE triggers SET last_fired_at = ?, last_status = ?, fire_count = fire_count + 1, next_fire_at = ? WHERE id = ?").run(firedAt, status, nextFireAt, triggerId);
   }
+}
+
+// Durable, coordinated claim: for each due schedule trigger, atomically advance
+// its next_fire_at with a compare-and-swap on the exact value we read. Only the
+// worker whose UPDATE changes the row has claimed that slot, so overlapping ticks
+// and multiple instances never double-fire. A durable trigger_fires record is
+// written per claimed slot (unique on (trigger, scheduled_for)) as the audit +
+// idempotency backstop. Returns [{ trigger, fireId, scheduledFor }].
+export function claimDueScheduleTriggers(nowMs = now(), limit = 100) {
+  const due = db.prepare("SELECT * FROM triggers WHERE type = 'schedule' AND enabled = 1 AND next_fire_at IS NOT NULL AND next_fire_at <= ? ORDER BY next_fire_at ASC LIMIT ?").all(nowMs, limit);
+  const claimed = [];
+  for (const t of due) {
+    const seen = t.next_fire_at;
+    const next = isValidCron(t.cron) ? nextFireAfter(t.cron, nowMs) : null;
+    const res = db.prepare("UPDATE triggers SET next_fire_at = ?, last_claimed_at = ? WHERE id = ? AND next_fire_at = ? AND enabled = 1").run(next, nowMs, t.id, seen);
+    if (res.changes !== 1) continue;          // another worker claimed this slot
+    const fireId = uid("fire");
+    try {
+      db.prepare("INSERT OR IGNORE INTO trigger_fires (id, trigger_id, org_id, scheduled_for, status, created_at) VALUES (?,?,?,?,?,?)")
+        .run(fireId, t.id, t.org_id, seen, "claimed", nowMs);
+    } catch { /* occurrence already recorded — idempotent */ }
+    claimed.push({ trigger: _triggerRow(t), fireId, scheduledFor: seen });
+  }
+  return claimed;
+}
+
+export function recordFireResult(fireId, { status = "ok", runId = null, firedAt = now() } = {}) {
+  const f = db.prepare("SELECT trigger_id FROM trigger_fires WHERE id = ?").get(fireId);
+  db.prepare("UPDATE trigger_fires SET status = ?, run_id = ?, fired_at = ? WHERE id = ?").run(status, runId, firedAt, fireId);
+  if (f) db.prepare("UPDATE triggers SET last_fired_at = ?, last_status = ?, fire_count = fire_count + 1 WHERE id = ?").run(firedAt, status, f.trigger_id);
+}
+
+export function listTriggerFires(triggerId, userId, limit = 50) {
+  const t = db.prepare("SELECT harness_id FROM triggers WHERE id = ?").get(triggerId);
+  if (!t || !roleFor(t.harness_id, userId)) throw new Error("You don't have access to this trigger.");
+  return db.prepare("SELECT id, scheduled_for, fired_at, status, run_id, created_at FROM trigger_fires WHERE trigger_id = ? ORDER BY created_at DESC LIMIT ?").all(triggerId, limit);
 }
 
 /* ── managed connections: per-org, credential sealed at rest, secret-free reads ── */

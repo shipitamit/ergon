@@ -221,6 +221,7 @@ export async function init(databaseUrl, injectedPool = null) {
       payload       TEXT,
       enabled       INTEGER NOT NULL DEFAULT 1,
       next_fire_at  BIGINT,
+      last_claimed_at BIGINT,
       last_fired_at BIGINT,
       last_status   TEXT,
       fire_count    INTEGER NOT NULL DEFAULT 0,
@@ -229,6 +230,19 @@ export async function init(databaseUrl, injectedPool = null) {
     );
     CREATE INDEX IF NOT EXISTS idx_triggers_harness ON triggers (harness_id);
     CREATE INDEX IF NOT EXISTS idx_triggers_due ON triggers (type, enabled, next_fire_at);
+
+    CREATE TABLE IF NOT EXISTS trigger_fires (
+      id            TEXT PRIMARY KEY,
+      trigger_id    TEXT NOT NULL REFERENCES triggers(id) ON DELETE CASCADE,
+      org_id        TEXT,
+      scheduled_for BIGINT,
+      fired_at      BIGINT,
+      status        TEXT NOT NULL DEFAULT 'claimed',
+      run_id        TEXT,
+      created_at    BIGINT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_trigger_fires_occurrence ON trigger_fires (trigger_id, scheduled_for);
+    CREATE INDEX IF NOT EXISTS idx_trigger_fires_trigger ON trigger_fires (trigger_id, created_at);
 
     CREATE TABLE IF NOT EXISTS connections (
       id           TEXT PRIMARY KEY,
@@ -500,6 +514,36 @@ export async function dueScheduleTriggers(nowMs = now(), limit = 100) {
 export async function markTriggerFired(triggerId, { firedAt = now(), status = "ok", nextFireAt = undefined } = {}) {
   if (nextFireAt === undefined) await exec("UPDATE triggers SET last_fired_at = $1, last_status = $2, fire_count = fire_count + 1 WHERE id = $3", [firedAt, status, triggerId]);
   else await exec("UPDATE triggers SET last_fired_at = $1, last_status = $2, fire_count = fire_count + 1, next_fire_at = $4 WHERE id = $3", [firedAt, status, triggerId, nextFireAt]);
+}
+
+// Durable, coordinated claim (mirrors db.mjs): compare-and-swap on next_fire_at so
+// exactly one worker claims each due slot; a durable trigger_fires record backs it.
+export async function claimDueScheduleTriggers(nowMs = now(), limit = 100) {
+  const due = await many("SELECT * FROM triggers WHERE type = 'schedule' AND enabled = 1 AND next_fire_at IS NOT NULL AND next_fire_at <= $1 ORDER BY next_fire_at ASC LIMIT $2", [nowMs, limit]);
+  const claimed = [];
+  for (const t of due) {
+    const seen = t.next_fire_at;
+    const next = isValidCron(t.cron) ? nextFireAfter(t.cron, nowMs) : null;
+    const won = await one("UPDATE triggers SET next_fire_at = $1, last_claimed_at = $2 WHERE id = $3 AND next_fire_at = $4 AND enabled = 1 RETURNING id", [next, nowMs, t.id, seen]);
+    if (!won) continue;                       // another worker claimed this slot
+    const fireId = uid("fire");
+    await exec("INSERT INTO trigger_fires (id, trigger_id, org_id, scheduled_for, status, created_at) VALUES ($1,$2,$3,$4,'claimed',$5) ON CONFLICT (trigger_id, scheduled_for) DO NOTHING",
+      [fireId, t.id, t.org_id, seen, nowMs]);
+    claimed.push({ trigger: _triggerRow(t), fireId, scheduledFor: Number(seen) });
+  }
+  return claimed;
+}
+
+export async function recordFireResult(fireId, { status = "ok", runId = null, firedAt = now() } = {}) {
+  const f = await one("SELECT trigger_id FROM trigger_fires WHERE id = $1", [fireId]);
+  await exec("UPDATE trigger_fires SET status = $1, run_id = $2, fired_at = $3 WHERE id = $4", [status, runId, firedAt, fireId]);
+  if (f) await exec("UPDATE triggers SET last_fired_at = $1, last_status = $2, fire_count = fire_count + 1 WHERE id = $3", [firedAt, status, f.trigger_id]);
+}
+
+export async function listTriggerFires(triggerId, userId, limit = 50) {
+  const t = await one("SELECT harness_id FROM triggers WHERE id = $1", [triggerId]);
+  if (!t || !await roleFor(t.harness_id, userId)) throw new Error("You don't have access to this trigger.");
+  return await many("SELECT id, scheduled_for, fired_at, status, run_id, created_at FROM trigger_fires WHERE trigger_id = $1 ORDER BY created_at DESC LIMIT $2", [triggerId, limit]);
 }
 
 /* ── managed connections (mirrors db.mjs) ── */

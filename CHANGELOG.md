@@ -7,9 +7,41 @@ together (see [Versioning](#versioning)). This project adheres to
 
 ## [Unreleased]
 
-### Planned
-- **Vector-store / document-loader adapters** for production-grade RAG
-  (pgvector is already a catalog entry).
+## [0.4.0] — 2026-10-27
+
+Durable runtime & production RAG. Makes multi-node flows and the trigger
+scheduler crash-resilient, and turns RAG into a pluggable, offline-tested
+adapter layer over the embedding providers and vector stores people run in
+production.
+
+### Added
+- **RAG adapter set.** Production embedding providers (`CohereEmbedder`,
+  `VoyageEmbedder`) and managed vector stores (`QdrantStore`, `ChromaStore`,
+  `PineconeStore`, `WeaviateStore`, `MilvusStore`) that drop into the existing
+  `Embedder` / `VectorStore` interfaces, plus `make_embedder` /
+  `make_vector_store` factories. The managed
+  adapters talk plain REST through an injectable HTTP transport that defaults to
+  the standard library — no vendor SDK or `requests` dependency — so their
+  request-shaping and response-parsing are unit-tested offline against a fake
+  transport. New document loaders (`ergon.loaders`: text/markdown/csv/tsv in the
+  stdlib, PDF via lazy pypdf, web pages with HTML stripped) back
+  `KnowledgeBase.add_file` / `add_url` / `add_path`, each attaching a `source`
+  for citation.
+- **Durable trigger scheduler.** The schedule scheduler now *claims* each due slot
+  with an atomic compare-and-swap on `next_fire_at` before firing, so overlapping
+  ticks and multiple instances never double-fire a cron trigger; each fire is
+  recorded in a durable `trigger_fires` log (unique per trigger+slot) with its run
+  id and status. A slot that came due while the process was down is caught up on
+  the next tick (at-least-once up to the claim), and a crash after the claim loses
+  at most that one slot — not the whole schedule. Both backends.
+- **Durable flow execution.** `Harness.run(store=…, run_id=…, resume=True)` makes a
+  multi-node harness crash-resilient: each node's output is checkpointed to a store
+  as it completes, and a resumed run (even in a different process) replays completed
+  nodes without re-executing them — no duplicate model calls or tool side-effects.
+  Stores: `FileCheckpointStore`, `SQLiteCheckpointStore` (shared-path cross-process
+  resume), `MemoryCheckpointStore`. A graph fingerprint refuses a resume into an
+  edited harness. Single-runner durable execution; distributed exactly-once and a
+  durable trigger scheduler remain future work.
 
 ## [0.3.0] — 2026-10-26
 
@@ -113,6 +145,7 @@ code and the runtime in sync. Database changes ship as forward-only migrations
 (`studio/server/migrations.mjs`, currently 0001–0011); newer tables (triggers,
 connections, version history) are also created idempotently at startup.
 
-[Unreleased]: https://example.com/ergon/compare/v0.3.0...HEAD
+[Unreleased]: https://example.com/ergon/compare/v0.4.0...HEAD
+[0.4.0]: https://example.com/ergon/compare/v0.3.0...v0.4.0
 [0.3.0]: https://example.com/ergon/compare/v0.2.0...v0.3.0
 [0.2.0]: https://example.com/ergon/releases/tag/v0.2.0

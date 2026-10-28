@@ -17,6 +17,8 @@ from .eval import (evaluate, load_dataset, EvalCase, EvalReport, Score,
                    json_valid, json_schema, numeric_close, custom, llm_judge,
                    compare_reports, load_report, EvalDiff)
 from .harness import Harness, load_harness
+from .durable import (CheckpointStore, FileCheckpointStore, SQLiteCheckpointStore,
+                      MemoryCheckpointStore)
 from .serve import serve, make_server, ServeConfig
 from .runs import RunRecord, RunRecorder, RunStep, run_and_record
 from .telemetry import Telemetry
@@ -24,6 +26,10 @@ from .browser import BrowserSession, browser_tools
 from .mcp import MCPClient, MCPOAuth, mcp_tools, mcp_resource_tools, mcp_prompt_tools, MCPError
 from .rag import (KnowledgeBase, retrieve_tool, Embedder, OpenAIEmbedder, FakeEmbedder,
                   VectorStore, InMemoryStore, PgVectorStore, Chunk, chunk_text)
+from .rag_adapters import (CohereEmbedder, VoyageEmbedder, make_embedder,
+                           QdrantStore, ChromaStore, PineconeStore,
+                           WeaviateStore, MilvusStore, make_vector_store)
+from . import loaders
 from .router import (resolve, Router, Deployment, LiteLLMProvider, ProviderSpec,
                      register_provider, register_cost, known_providers)
 from .connections import connection, Connection, ConnectionError
@@ -38,7 +44,7 @@ from .tools import (
     web_search_tool,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 __all__ = [
     "Agent", "AgentResult", "ApprovalPolicy", "ApprovalDenied",
     "ErgonError", "ProviderError", "RateLimitError", "TransientProviderError",
@@ -50,6 +56,7 @@ __all__ = [
     "AnthropicProvider", "OpenAIProvider", "GeminiProvider", "BedrockProvider",
     "chain", "route", "parallel", "branch", "loop", "Usage", "set_prices", "price_for",
     "Harness", "load_harness", "serve", "make_server", "ServeConfig",
+    "CheckpointStore", "FileCheckpointStore", "SQLiteCheckpointStore", "MemoryCheckpointStore",
     "RunRecord", "RunRecorder", "RunStep", "run_and_record",
     "CancelToken", "StreamEvent",
     "evaluate", "load_dataset", "EvalCase", "EvalReport", "Score",
@@ -61,6 +68,9 @@ __all__ = [
     "MCPClient", "MCPOAuth", "mcp_tools", "mcp_resource_tools", "mcp_prompt_tools", "MCPError",
     "KnowledgeBase", "retrieve_tool", "Embedder", "OpenAIEmbedder", "FakeEmbedder",
     "VectorStore", "InMemoryStore", "PgVectorStore", "Chunk", "chunk_text",
+    "CohereEmbedder", "VoyageEmbedder", "make_embedder",
+    "QdrantStore", "ChromaStore", "PineconeStore", "WeaviateStore", "MilvusStore",
+    "make_vector_store", "loaders",
     "resolve", "Router", "Deployment", "LiteLLMProvider", "ProviderSpec",
     "register_provider", "register_cost", "known_providers",
     "connection", "Connection", "ConnectionError",
