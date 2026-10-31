@@ -1,6 +1,6 @@
 # Ergon
 
-A toolkit for building AI agent harnesses — a Python **SDK** (the engine) and a
+A toolkit for building AI agent harnesses - a Python **SDK** (the engine) and a
 drag-and-drop visual **Studio** (the builder) that generates code against it.
 
 This is a monorepo: both halves live here because they move together. The
@@ -12,7 +12,7 @@ apart.
 
 ```
 ergon/
-├── sdk/       Python SDK — the agent harness engine (pip install ./sdk)
+├── sdk/       Python SDK - the agent harness engine (pip install ./sdk)
 ├── studio/    Vite + React visual builder + Node proxy (npm --prefix studio)
 ├── examples/  Shared harness JSON, eval datasets, worked examples
 ├── docs/      Generated static docs site (scripts/build-docs.mjs)
@@ -24,10 +24,10 @@ ergon/
 | Path | What it is | Toolchain |
 |------|-----------|-----------|
 | [`sdk/`](sdk/) | The `ergon` Python package: agent loop, tools, approval, compaction, streaming, providers, unified routing, eval, browser control | Python ≥3.9, pip |
-| [`studio/`](studio/) | The visual harness builder — canvas, inspector, live preview, codegen, optional accounts | Node ≥18, npm |
+| [`studio/`](studio/) | The visual harness builder - canvas, inspector, live preview, codegen, optional accounts | Node ≥18, npm |
 | [`examples/`](examples/) | Provider-neutral harness graphs + eval datasets you can import into the Studio or run through the SDK bridge | — |
 
-The two halves have **separate toolchains** — there's no single build that does
+The two halves have **separate toolchains** - there's no single build that does
 both. Use the bootstrap script, or set each up on its own (below).
 
 ## Quick start
@@ -35,11 +35,11 @@ both. Use the bootstrap script, or set each up on its own (below).
 One command sets up both halves and starts the Studio:
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...      # the default provider — or use any of ~15 (see Providers)
+export ANTHROPIC_API_KEY=sk-ant-...      # the default provider - or use any of ~15 (see Providers)
 ./scripts/bootstrap.sh                   # install if needed, then start (http://localhost:5173)
 ```
 
-`bootstrap.sh` is the single entry point — it reads a root `.env` if present and
+`bootstrap.sh` is the single entry point - it reads a root `.env` if present and
 takes a subcommand:
 
 ```bash
@@ -61,7 +61,7 @@ python sdk/examples/quickstart.py        # run an agent via the SDK
 
 ## Providers
 
-Ergon is **not Anthropic-only** — Anthropic is just the default, so the quickstart
+Ergon is **not Anthropic-only** - Anthropic is just the default, so the quickstart
 shows one key. The unified router reaches ~15 providers, and each
 agent picks its own. Set only the key(s) you use, via an env var **or** in the
 Studio (**Settings → Keys**, stored encrypted):
@@ -110,10 +110,10 @@ See each subproject's README for depth:
 
 ## Project
 
-- [CHANGELOG.md](CHANGELOG.md) — what shipped, by phase.
-- [CONTRIBUTING.md](CONTRIBUTING.md) — dev setup, tests, PR flow, releases.
-- [SECURITY.md](SECURITY.md) — reporting + security properties.
-- [SUPPORT.md](SUPPORT.md) — where to ask for help.
+- [CHANGELOG.md](CHANGELOG.md) - what shipped, by phase.
+- [CONTRIBUTING.md](CONTRIBUTING.md) - dev setup, tests, PR flow, releases.
+- [SECURITY.md](SECURITY.md) - reporting + security properties.
+- [SUPPORT.md](SUPPORT.md) - where to ask for help.
 - [Code of Conduct](CODE_OF_CONDUCT.md).
 - Governance: [SOC 2 controls matrix](docs/soc2-controls.md) ·
   [data governance](docs/data-governance.md).
@@ -121,7 +121,7 @@ See each subproject's README for depth:
 ## Documentation
 
 All the READMEs are also published as a single static docs site with a nav and
-in-page search of headings — no build toolchain or dependencies:
+in-page search of headings - no build toolchain or dependencies:
 
 ```bash
 node scripts/build-docs.mjs      # regenerates docs/index.html from the READMEs

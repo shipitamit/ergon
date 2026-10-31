@@ -16,6 +16,21 @@ import {
 } from "./oidc.mjs";
 import { forwardRun } from "./gateway.mjs";
 import { fireTrigger } from "./triggers.mjs";
+import { evaluateAlerts } from "./alerts.mjs";
+import * as hosting from "./hosting.mjs";
+import { makeMachinesDriver } from "./hosting-driver.mjs";
+
+// The machines driver for managed hosting, chosen by env. Defaults to the
+// in-memory fake (zero-infra), so managed deploys work out of the box in dev;
+// set ERGON_HOSTING_DRIVER=fly + FLY_APP/FLY_API_TOKEN for real Fly Machines.
+const hostingDriver = (() => {
+  try {
+    if ((process.env.ERGON_HOSTING_DRIVER || "").toLowerCase() === "fly" && process.env.FLY_APP) {
+      return makeMachinesDriver("fly", { app: process.env.FLY_APP, token: process.env.FLY_API_TOKEN, defaultRegion: process.env.FLY_REGION });
+    }
+  } catch { /* fall through to fake */ }
+  return makeMachinesDriver("fake");
+})();
 import { listConnectors, getConnector } from "./connectors.mjs";
 import { pkcePair as oauthPkce, oauthConfigFor, oauthAvailable, buildAuthUrl, exchangeCode as oauthExchangeCode } from "./oauth-connections.mjs";
 
@@ -95,6 +110,7 @@ export async function handleApiRoutes(req, res) {
   const p = url.pathname;
   if (!p.startsWith("/api/auth") && !p.startsWith("/api/harnesses") &&
       !p.startsWith("/api/kv") && !p.startsWith("/api/orgs") && !p.startsWith("/api/runs") &&
+      !p.startsWith("/api/metrics") &&
       !p.startsWith("/api/gw") && !p.startsWith("/api/hook") && !p.startsWith("/api/connectors") &&
       !p.startsWith("/api/connections")) return false;
 
@@ -274,10 +290,32 @@ export async function handleApiRoutes(req, res) {
         before: url.searchParams.get("before") != null ? Number(url.searchParams.get("before")) : null,
       }) }), true;
     }
+    if (p === "/api/runs/search" && req.method === "GET") {
+      if (!requireAuth()) return true;
+      const sp = url.searchParams;
+      const num = (k) => (sp.get(k) != null ? Number(sp.get(k)) : null);
+      return json(res, 200, { runs: await db.searchRuns(me.id, {
+        orgId: sp.get("orgId"), q: sp.get("q"), status: sp.get("status"),
+        failed: sp.get("failed") === "true" || sp.get("failed") === "1",
+        harnessId: sp.get("harnessId"), from: num("from"), to: num("to"),
+        minLatencyMs: num("minLatencyMs"), minCost: num("minCost"),
+        limit: num("limit") || undefined, before: num("before"),
+      }) }), true;
+    }
     const runMatch = p.match(/^\/api\/runs\/([^/]+)$/);
     if (runMatch && req.method === "GET") {
       if (!requireAuth()) return true;
       return json(res, 200, { run: await db.getRun(me.id, decodeURIComponent(runMatch[1])) }), true;
+    }
+    if (p === "/api/metrics" && req.method === "GET") {
+      if (!requireAuth()) return true;
+      const num = (k) => (url.searchParams.get(k) != null ? Number(url.searchParams.get(k)) : null);
+      return json(res, 200, await db.metricsSummary(me.id, {
+        orgId: url.searchParams.get("orgId"),
+        from: num("from"), to: num("to"),
+        bucket: url.searchParams.get("bucket") || "day",
+        harnessId: url.searchParams.get("harnessId"),
+      })), true;
     }
 
     // ── organizations (the access model: harness access = org role) ──
@@ -377,6 +415,82 @@ export async function handleApiRoutes(req, res) {
       const oid = decodeURIComponent(connItemMatch[1]), cid = decodeURIComponent(connItemMatch[2]);
       if (req.method === "PATCH") { const { name, config, secret } = await readBody(req); return json(res, 200, { connection: await db.updateConnection(oid, me.id, cid, { name, config, secret }) }), true; }
       if (req.method === "DELETE") return json(res, 200, await db.deleteConnection(oid, me.id, cid)), true;
+    }
+
+    // ── alerting (signed-in surface; owner/admin to mutate, any member to read) ──
+    const alertEventsMatch = p.match(/^\/api\/orgs\/([^/]+)\/alert-events$/);
+    if (alertEventsMatch && req.method === "GET") {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Alerts are a signed-in surface." }); return true; }
+      const oid = decodeURIComponent(alertEventsMatch[1]);
+      const lim = url.searchParams.get("limit") != null ? Number(url.searchParams.get("limit")) : undefined;
+      return json(res, 200, { events: await db.listAlertEvents(oid, me.id, { limit: lim }) }), true;
+    }
+    const alertEvalMatch = p.match(/^\/api\/orgs\/([^/]+)\/alerts\/evaluate$/);
+    if (alertEvalMatch && req.method === "POST") {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Alerts are a signed-in surface." }); return true; }
+      const oid = decodeURIComponent(alertEvalMatch[1]);
+      if (!(await db.orgRoleFor(oid, me.id))) { json(res, 403, { error: "Not a member of this organization." }); return true; }
+      // evaluate just this org's rules (filter inside the shared evaluator)
+      const transitions = (await evaluateAlerts({
+        allEnabledAlertRules: async () => (await db.listAlertRules(oid, me.id)).filter((r) => r.enabled),
+        alertAggregate: db.alertAggregate, recordAlertEvent: db.recordAlertEvent,
+        setAlertRuleState: db.setAlertRuleState,
+      }));
+      return json(res, 200, { transitions }), true;
+    }
+    const alertsMatch = p.match(/^\/api\/orgs\/([^/]+)\/alerts$/);
+    if (alertsMatch) {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Alerts are a signed-in surface." }); return true; }
+      const oid = decodeURIComponent(alertsMatch[1]);
+      if (req.method === "GET") return json(res, 200, { rules: await db.listAlertRules(oid, me.id) }), true;
+      if (req.method === "POST") {
+        const { name, metric, comparator, threshold, windowMs, harnessId } = await readBody(req);
+        return json(res, 200, { rule: await db.createAlertRule(oid, me.id, { name, metric, comparator, threshold, windowMs, harnessId }) }), true;
+      }
+    }
+    const alertItemMatch = p.match(/^\/api\/orgs\/([^/]+)\/alerts\/([^/]+)$/);
+    if (alertItemMatch) {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Alerts are a signed-in surface." }); return true; }
+      const rid = decodeURIComponent(alertItemMatch[2]);
+      if (req.method === "PATCH") return json(res, 200, { rule: await db.updateAlertRule(me.id, rid, await readBody(req)) }), true;
+      if (req.method === "DELETE") return json(res, 200, await db.deleteAlertRule(me.id, rid)), true;
+    }
+
+    // ── managed hosting: Ergon-operated runners (signed-in; owner/admin to mutate) ──
+    const runnerActionMatch = p.match(/^\/api\/orgs\/([^/]+)\/runners\/([^/]+)\/(stop|restart|refresh|logs)$/);
+    if (runnerActionMatch) {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Managed hosting is a signed-in surface." }); return true; }
+      const rid = decodeURIComponent(runnerActionMatch[2]); const action = runnerActionMatch[3];
+      if (action === "logs" && req.method === "GET") return json(res, 200, { logs: await hosting.logs(db, me.id, rid, { driver: hostingDriver }) }), true;
+      if (req.method === "POST") {
+        if (action === "stop") return json(res, 200, { runner: await hosting.stop(db, me.id, rid, { driver: hostingDriver }) }), true;
+        if (action === "restart") return json(res, 200, { runner: await hosting.restart(db, me.id, rid, { driver: hostingDriver }) }), true;
+        if (action === "refresh") return json(res, 200, { runner: await hosting.refresh(db, me.id, rid, { driver: hostingDriver }) }), true;
+      }
+    }
+    const runnerItemMatch = p.match(/^\/api\/orgs\/([^/]+)\/runners\/([^/]+)$/);
+    if (runnerItemMatch) {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Managed hosting is a signed-in surface." }); return true; }
+      const oid = decodeURIComponent(runnerItemMatch[1]), rid = decodeURIComponent(runnerItemMatch[2]);
+      if (req.method === "GET") return json(res, 200, { runner: await db.getManagedRunner(me.id, rid) }), true;
+      if (req.method === "DELETE") return json(res, 200, await hosting.remove(db, me.id, rid, { driver: hostingDriver })), true;
+    }
+    const runnersMatch = p.match(/^\/api\/orgs\/([^/]+)\/runners$/);
+    if (runnersMatch) {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Managed hosting is a signed-in surface." }); return true; }
+      const oid = decodeURIComponent(runnersMatch[1]);
+      if (req.method === "GET") return json(res, 200, { runners: await db.listManagedRunners(oid, me.id) }), true;
+      if (req.method === "POST") {
+        const { harnessId, slug, region, image, env } = await readBody(req);
+        return json(res, 200, { runner: await hosting.provision(db, { orgId: oid, userId: me.id, harnessId, slug, region, image, env }, { driver: hostingDriver, apiUrl: publicOrigin(req) }) }), true;
+      }
     }
 
     // ── runner-side resolver: decrypt + (OAuth) refresh, return run-time material.

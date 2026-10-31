@@ -166,6 +166,36 @@ export async function init(databaseUrl, injectedPool = null) {
     );
     CREATE INDEX IF NOT EXISTS idx_runs_org_created ON runs (org_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_runs_harness ON runs (harness_id);
+    CREATE TABLE IF NOT EXISTS alert_rules (
+      id           TEXT PRIMARY KEY,
+      org_id       TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+      name         TEXT NOT NULL,
+      metric       TEXT NOT NULL,
+      comparator   TEXT NOT NULL,
+      threshold    REAL NOT NULL,
+      window_ms    BIGINT NOT NULL,
+      harness_id   TEXT,
+      enabled      INTEGER NOT NULL DEFAULT 1,
+      last_state   TEXT NOT NULL DEFAULT 'ok',
+      last_evaluated_at BIGINT,
+      last_triggered_at BIGINT,
+      created_by   TEXT,
+      created_at   BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_alert_rules_org ON alert_rules (org_id);
+    CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules (enabled);
+    CREATE TABLE IF NOT EXISTS alert_events (
+      id           TEXT PRIMARY KEY,
+      rule_id      TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+      org_id       TEXT NOT NULL,
+      state        TEXT NOT NULL,
+      value        REAL,
+      threshold    REAL,
+      message      TEXT,
+      created_at   BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_alert_events_rule ON alert_events (rule_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_alert_events_org ON alert_events (org_id, created_at);
     CREATE TABLE IF NOT EXISTS budgets (
       id           TEXT PRIMARY KEY,
       org_id       TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
@@ -188,6 +218,27 @@ export async function init(databaseUrl, injectedPool = null) {
       created_at  BIGINT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_deployments_org ON deployments (org_id);
+    CREATE TABLE IF NOT EXISTS managed_runners (
+      id            TEXT PRIMARY KEY,
+      org_id        TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+      harness_id    TEXT,
+      deployment_id TEXT,
+      slug          TEXT,
+      driver        TEXT NOT NULL,
+      machine_id    TEXT,
+      region        TEXT,
+      image         TEXT,
+      status        TEXT NOT NULL DEFAULT 'provisioning',
+      url           TEXT,
+      detail        TEXT,
+      api_key_id    TEXT,
+      last_health_at BIGINT,
+      created_by    TEXT,
+      created_at    BIGINT NOT NULL,
+      updated_at    BIGINT NOT NULL
+    );
+    ALTER TABLE managed_runners ADD COLUMN IF NOT EXISTS api_key_id TEXT;
+    CREATE INDEX IF NOT EXISTS idx_managed_runners_org ON managed_runners (org_id);
     CREATE TABLE IF NOT EXISTS comments (
       id         TEXT PRIMARY KEY,
       harness_id TEXT NOT NULL REFERENCES harnesses(id) ON DELETE CASCADE,
@@ -861,6 +912,29 @@ export async function listRuns(userId, { orgId, harnessId = null, limit = 50, be
   return rows.map(_runSummary);
 }
 
+export async function searchRuns(userId, { orgId, q = null, status = null, failed = false,
+    harnessId = null, from = null, to = null, minLatencyMs = null, minCost = null,
+    limit = 50, before = null } = {}) {
+  if (!orgId) throw new Error("orgId is required.");
+  if (!await orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const args = [orgId]; let n = 1; const clauses = [`org_id = $1`];
+  if (status) { n++; clauses.push(`status = $${n}`); args.push(status); }
+  if (failed) { clauses.push("status <> 'ok'"); }
+  if (harnessId) { n++; clauses.push(`harness_id = $${n}`); args.push(harnessId); }
+  if (from != null) { n++; clauses.push(`created_at >= $${n}`); args.push(Number(from)); }
+  if (to != null) { n++; clauses.push(`created_at < $${n}`); args.push(Number(to)); }
+  if (minLatencyMs != null) { n++; clauses.push(`latency_ms >= $${n}`); args.push(Number(minLatencyMs)); }
+  if (minCost != null) { n++; clauses.push(`cost >= $${n}`); args.push(Number(minCost)); }
+  if (before != null) { n++; clauses.push(`created_at < $${n}`); args.push(Number(before)); }
+  if (q) { n++; clauses.push(`(input ILIKE $${n} OR output ILIKE $${n})`); args.push(`%${q}%`); }
+  n++;
+  const rows = await many(`SELECT id, harness_id, harness_name, status, started_at, finished_at,
+      latency_ms, tokens_in, tokens_out, cost, created_at, created_by, substr(input, 1, 200) AS input_preview
+    FROM runs WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC LIMIT $${n}`, [...args, lim]);
+  return rows.map(_runSummary);
+}
+
 export async function getRun(userId, runId) {
   const r = await one("SELECT * FROM runs WHERE id = $1", [runId]);
   if (!r) throw new Error("Run not found.");
@@ -879,6 +953,170 @@ function _runSummary(r) {
     createdAt: Number(r.created_at), createdBy: r.created_by,
     inputPreview: r.input_preview !== undefined ? r.input_preview : (r.input || "").slice(0, 200),
   };
+}
+
+// ── observability: aggregate metrics over the runs store (see db.mjs) ──
+export async function metricsSummary(userId, { orgId, from = null, to = null, bucket = "day", harnessId = null } = {}) {
+  if (!orgId) throw new Error("orgId is required.");
+  if (!await orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  const toMs = Number(to) || now();
+  const fromMs = Number(from) || (toMs - 7 * 86400_000);
+  const bucketMs = bucket === "hour" ? 3600_000 : 86400_000;
+  const args = [orgId, fromMs, toMs]; let n = 3;
+  const clauses = ["org_id = $1", "created_at >= $2", "created_at < $3"];
+  if (harnessId) { n++; clauses.push(`harness_id = $${n}`); args.push(harnessId); }
+  const where = clauses.join(" AND ");
+  const bp = `$${n + 1}`;   // bucket-size parameter, appended after the where args
+
+  const t = await one(`SELECT COUNT(*)::int AS runs,
+      COALESCE(SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END),0)::int AS errors,
+      COALESCE(SUM(tokens_in),0)::bigint AS tokens_in, COALESCE(SUM(tokens_out),0)::bigint AS tokens_out,
+      COALESCE(SUM(cost),0)::float AS cost, AVG(latency_ms)::float AS avg_latency,
+      percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms)::float AS p50,
+      percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::float AS p95
+    FROM runs WHERE ${where}`, args);
+
+  const series = await many(`SELECT (created_at / ${bp}) * ${bp} AS t, COUNT(*)::int AS runs,
+      COALESCE(SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END),0)::int AS errors,
+      COALESCE(SUM(cost),0)::float AS cost, COALESCE(SUM(tokens_in),0)::bigint AS tokens_in,
+      COALESCE(SUM(tokens_out),0)::bigint AS tokens_out, AVG(latency_ms)::float AS avg_latency
+    FROM runs WHERE ${where} GROUP BY t ORDER BY t`, [...args, bucketMs]);
+
+  const byHarness = await many(`SELECT harness_id, harness_name, COUNT(*)::int AS runs,
+      COALESCE(SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END),0)::int AS errors,
+      COALESCE(SUM(cost),0)::float AS cost
+    FROM runs WHERE ${where} GROUP BY harness_id, harness_name ORDER BY runs DESC LIMIT 10`, args);
+
+  const runs = Number(t.runs || 0), errors = Number(t.errors || 0);
+  return {
+    range: { from: fromMs, to: toMs, bucket },
+    totals: {
+      runs, errors, successRate: runs ? (runs - errors) / runs : null,
+      tokensIn: Number(t.tokens_in || 0), tokensOut: Number(t.tokens_out || 0), cost: Number(t.cost || 0),
+      latencyAvg: t.avg_latency != null ? Math.round(Number(t.avg_latency)) : null,
+      latencyP50: t.p50 != null ? Math.round(Number(t.p50)) : null,
+      latencyP95: t.p95 != null ? Math.round(Number(t.p95)) : null,
+    },
+    series: series.map((s) => ({
+      t: Number(s.t), runs: Number(s.runs), errors: Number(s.errors), cost: Number(s.cost),
+      tokensIn: Number(s.tokens_in), tokensOut: Number(s.tokens_out),
+      avgLatency: s.avg_latency != null ? Math.round(Number(s.avg_latency)) : null,
+    })),
+    byHarness: byHarness.map((h) => ({
+      harnessId: h.harness_id, harnessName: h.harness_name,
+      runs: Number(h.runs), errors: Number(h.errors), cost: Number(h.cost),
+    })),
+  };
+}
+
+// ── alerting (see db.mjs for the model) ──
+const ALERT_METRICS = ["error_rate", "spend", "latency_p95", "run_count"];
+
+function _alertRule(r) {
+  return {
+    id: r.id, orgId: r.org_id, name: r.name, metric: r.metric, comparator: r.comparator,
+    threshold: Number(r.threshold), windowMs: Number(r.window_ms), harnessId: r.harness_id,
+    enabled: !!r.enabled, lastState: r.last_state,
+    lastEvaluatedAt: r.last_evaluated_at != null ? Number(r.last_evaluated_at) : null,
+    lastTriggeredAt: r.last_triggered_at != null ? Number(r.last_triggered_at) : null,
+    createdBy: r.created_by, createdAt: Number(r.created_at),
+  };
+}
+
+export async function createAlertRule(orgId, userId, { name, metric, comparator, threshold, windowMs, harnessId = null } = {}) {
+  const role = await orgRoleFor(orgId, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage alerts.");
+  if (!name) throw new Error("An alert needs a name.");
+  if (!ALERT_METRICS.includes(metric)) throw new Error(`metric must be one of ${ALERT_METRICS.join(", ")}.`);
+  if (comparator !== ">" && comparator !== "<") throw new Error("comparator must be '>' or '<'.");
+  if (threshold == null || isNaN(Number(threshold))) throw new Error("threshold must be a number.");
+  if (!windowMs || Number(windowMs) <= 0) throw new Error("windowMs must be a positive number.");
+  const id = uid("alr");
+  await exec(`INSERT INTO alert_rules (id, org_id, name, metric, comparator, threshold, window_ms,
+      harness_id, enabled, last_state, created_by, created_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'ok',$9,$10)`,
+    [id, orgId, name, metric, comparator, Number(threshold), Number(windowMs), harnessId || null, userId, now()]);
+  return _alertRule(await one("SELECT * FROM alert_rules WHERE id = $1", [id]));
+}
+
+export async function listAlertRules(orgId, userId) {
+  if (!await orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  return (await many("SELECT * FROM alert_rules WHERE org_id = $1 ORDER BY created_at DESC", [orgId])).map(_alertRule);
+}
+
+export async function updateAlertRule(userId, ruleId, patch = {}) {
+  const r = await one("SELECT * FROM alert_rules WHERE id = $1", [ruleId]);
+  if (!r) throw new Error("Alert rule not found.");
+  const role = await orgRoleFor(r.org_id, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage alerts.");
+  const comparator = patch.comparator ?? r.comparator;
+  if (comparator !== ">" && comparator !== "<") throw new Error("comparator must be '>' or '<'.");
+  await exec(`UPDATE alert_rules SET name=$1, comparator=$2, threshold=$3, window_ms=$4, harness_id=$5, enabled=$6
+    WHERE id=$7`, [
+    patch.name ?? r.name, comparator,
+    patch.threshold != null ? Number(patch.threshold) : r.threshold,
+    patch.windowMs != null ? Number(patch.windowMs) : r.window_ms,
+    patch.harnessId !== undefined ? (patch.harnessId || null) : r.harness_id,
+    patch.enabled != null ? (patch.enabled ? 1 : 0) : r.enabled, ruleId]);
+  return _alertRule(await one("SELECT * FROM alert_rules WHERE id = $1", [ruleId]));
+}
+
+export async function deleteAlertRule(userId, ruleId) {
+  const r = await one("SELECT * FROM alert_rules WHERE id = $1", [ruleId]);
+  if (!r) throw new Error("Alert rule not found.");
+  const role = await orgRoleFor(r.org_id, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage alerts.");
+  await exec("DELETE FROM alert_rules WHERE id = $1", [ruleId]);
+  return { ok: true };
+}
+
+export async function listAlertEvents(orgId, userId, { limit = 50 } = {}) {
+  if (!await orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  return (await many(`SELECT id, rule_id, org_id, state, value, threshold, message, created_at
+    FROM alert_events WHERE org_id = $1 ORDER BY created_at DESC LIMIT $2`, [orgId, lim]))
+    .map((e) => ({ id: e.id, ruleId: e.rule_id, orgId: e.org_id, state: e.state,
+      value: e.value != null ? Number(e.value) : null,
+      threshold: e.threshold != null ? Number(e.threshold) : null,
+      message: e.message, createdAt: Number(e.created_at) }));
+}
+
+export async function allEnabledAlertRules() {
+  return (await many("SELECT * FROM alert_rules WHERE enabled = 1")).map(_alertRule);
+}
+
+export async function alertAggregate(orgId, { windowMs, harnessId = null, now: nowMs = now() } = {}) {
+  const fromMs = nowMs - Number(windowMs || 0);
+  // inclusive upper bound (see db.mjs): count a run recorded in the same ms.
+  const args = [orgId, fromMs, nowMs]; let n = 3;
+  const clauses = ["org_id = $1", "created_at >= $2", "created_at <= $3"];
+  if (harnessId) { n++; clauses.push(`harness_id = $${n}`); args.push(harnessId); }
+  const where = clauses.join(" AND ");
+  const t = await one(`SELECT COUNT(*)::int AS runs,
+      COALESCE(SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END),0)::int AS errors,
+      COALESCE(SUM(cost),0)::float AS spend,
+      percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::float AS p95
+    FROM runs WHERE ${where}`, args);
+  const runs = Number(t.runs || 0), errors = Number(t.errors || 0);
+  return { runs, errors, errorRate: runs ? errors / runs : 0,
+           spend: Number(t.spend || 0), latencyP95: t.p95 != null ? Math.round(Number(t.p95)) : null };
+}
+
+export async function recordAlertEvent(ruleId, orgId, { state, value = null, threshold = null, message = null } = {}) {
+  const id = uid("ale");
+  await exec(`INSERT INTO alert_events (id, rule_id, org_id, state, value, threshold, message, created_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [id, ruleId, orgId, state, value, threshold, message, now()]);
+  return { id };
+}
+
+export async function setAlertRuleState(ruleId, { state, evaluatedAt = now(), triggeredAt = undefined } = {}) {
+  if (triggeredAt !== undefined) {
+    await exec("UPDATE alert_rules SET last_state=$1, last_evaluated_at=$2, last_triggered_at=$3 WHERE id=$4",
+      [state, evaluatedAt, triggeredAt, ruleId]);
+  } else {
+    await exec("UPDATE alert_rules SET last_state=$1, last_evaluated_at=$2 WHERE id=$3",
+      [state, evaluatedAt, ruleId]);
+  }
 }
 
 // ── budgets & quotas (see db.mjs for the model) ──
@@ -986,6 +1224,67 @@ export async function resolveDeployment(slug) {
   const d = await one("SELECT id, org_id, harness_id, slug, target_url, status FROM deployments WHERE slug = $1", [String(slug || "").toLowerCase()]);
   if (!d) return null;
   return { id: d.id, orgId: d.org_id, harnessId: d.harness_id, slug: d.slug, targetUrl: d.target_url, status: d.status };
+}
+
+// ── managed runners (see db.mjs for the model) ──
+function _managedRunner(r) {
+  return {
+    id: r.id, orgId: r.org_id, harnessId: r.harness_id, deploymentId: r.deployment_id,
+    slug: r.slug, driver: r.driver, machineId: r.machine_id, region: r.region, image: r.image,
+    status: r.status, url: r.url, detail: r.detail, apiKeyId: r.api_key_id,
+    lastHealthAt: r.last_health_at != null ? Number(r.last_health_at) : null,
+    createdBy: r.created_by, createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
+  };
+}
+
+export async function createManagedRunner(orgId, userId, { harnessId = null, slug = null, driver, region = null, image = null } = {}) {
+  const role = await orgRoleFor(orgId, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can provision runners.");
+  if (!driver) throw new Error("A machines driver is required.");
+  const id = uid("run"); const t = now();
+  await exec(`INSERT INTO managed_runners (id, org_id, harness_id, slug, driver, region, image, status, created_by, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,'provisioning',$8,$9,$10)`, [id, orgId, harnessId, slug, driver, region, image, userId, t, t]);
+  await logAudit(orgId, userId, "runner.provision", { targetType: "runner", targetId: id, detail: { harnessId, slug, driver } });
+  return _managedRunner(await one("SELECT * FROM managed_runners WHERE id = $1", [id]));
+}
+
+export async function getManagedRunner(userId, runnerId) {
+  const r = await one("SELECT * FROM managed_runners WHERE id = $1", [runnerId]);
+  if (!r) throw new Error("Runner not found.");
+  if (!await orgRoleFor(r.org_id, userId)) throw new Error("Not a member of this organization.");
+  return _managedRunner(r);
+}
+
+export async function listManagedRunners(orgId, userId) {
+  if (!await orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  return (await many("SELECT * FROM managed_runners WHERE org_id = $1 ORDER BY created_at DESC", [orgId])).map(_managedRunner);
+}
+
+export async function updateManagedRunner(runnerId, patch = {}) {
+  const r = await one("SELECT * FROM managed_runners WHERE id = $1", [runnerId]);
+  if (!r) throw new Error("Runner not found.");
+  const pick = (k, col) => (patch[k] !== undefined ? patch[k] : r[col]);
+  await exec(`UPDATE managed_runners SET deployment_id=$1, slug=$2, machine_id=$3, region=$4, image=$5, status=$6, url=$7, detail=$8, api_key_id=$9, last_health_at=$10, updated_at=$11 WHERE id=$12`,
+    [pick("deploymentId", "deployment_id"), pick("slug", "slug"), pick("machineId", "machine_id"),
+     pick("region", "region"), pick("image", "image"), pick("status", "status"), pick("url", "url"),
+     pick("detail", "detail"), pick("apiKeyId", "api_key_id"), pick("lastHealthAt", "last_health_at"), now(), runnerId]);
+  return _managedRunner(await one("SELECT * FROM managed_runners WHERE id = $1", [runnerId]));
+}
+
+export async function deleteManagedRunner(orgId, userId, runnerId) {
+  const role = await orgRoleFor(orgId, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can remove runners.");
+  await exec("DELETE FROM managed_runners WHERE id = $1 AND org_id = $2", [runnerId, orgId]);
+  await logAudit(orgId, userId, "runner.delete", { targetType: "runner", targetId: runnerId });
+  return { deleted: true };
+}
+
+export async function setDeploymentTarget(depId, { targetUrl, status } = {}) {
+  const d = await one("SELECT * FROM deployments WHERE id = $1", [depId]);
+  if (!d) return null;
+  await exec("UPDATE deployments SET target_url = $1, status = $2 WHERE id = $3",
+    [targetUrl !== undefined ? targetUrl : d.target_url, status !== undefined ? status : d.status, depId]);
+  return { id: depId };
 }
 
 /* ── node-anchored comments (collaboration; see db.mjs for the model) ── */

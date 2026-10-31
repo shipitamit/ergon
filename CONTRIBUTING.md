@@ -1,7 +1,7 @@
 # Contributing to Ergon
 
 Thanks for your interest. Ergon is a monorepo with two separate toolchains — a
-Python **SDK** (`sdk/`) and a Node/React **Studio** (`studio/`) — that release
+Python **SDK** (`sdk/`) and a Node/React **Studio** (`studio/`) - that release
 together. This guide covers setup, tests, and the PR + release flow.
 
 ## Development setup
@@ -19,10 +19,10 @@ needed to develop or test. Set `ANTHROPIC_API_KEY` only to run real agents.
 
 ## Running the tests
 
-Both suites are **offline and dependency-light** — they must stay that way.
+Both suites are **offline and dependency-light** - they must stay that way.
 
 ```bash
-# SDK — a no-pytest shim runs the whole suite with stdlib only
+# SDK - a no-pytest shim runs the whole suite with stdlib only
 cd sdk && PYTHONPATH=. python tests/_run_without_pytest.py
 #   (pytest also works if installed: `pytest`)
 
@@ -38,13 +38,13 @@ the offline suite. Any data-layer change must update **both** backends and the
 fake-pool parity.
 
 Database schema changes are **forward-only migrations** in
-`studio/server/migrations.mjs` — add the next numbered migration; never edit an
+`studio/server/migrations.mjs` - add the next numbered migration; never edit an
 applied one. `npm run migrate` applies them on a fresh DB.
 
 ## Pull requests
 
 1. Branch from the default branch; keep a PR focused on one change.
-2. Add or update tests — a feature without a test won't be merged. Keep tests
+2. Add or update tests - a feature without a test won't be merged. Keep tests
    offline (fake provider / fake pool).
 3. Update docs: the relevant README, and `CHANGELOG.md` under *Unreleased*.
 4. Run both suites locally; CI (`.github/workflows/`) runs them on push plus

@@ -176,6 +176,36 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_org_created ON runs (org_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_harness ON runs (harness_id);
+CREATE TABLE IF NOT EXISTS alert_rules (
+  id           TEXT PRIMARY KEY,
+  org_id       TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  name         TEXT NOT NULL,
+  metric       TEXT NOT NULL,
+  comparator   TEXT NOT NULL,
+  threshold    REAL NOT NULL,
+  window_ms    INTEGER NOT NULL,
+  harness_id   TEXT,
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  last_state   TEXT NOT NULL DEFAULT 'ok',
+  last_evaluated_at INTEGER,
+  last_triggered_at INTEGER,
+  created_by   TEXT,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alert_rules_org ON alert_rules (org_id);
+CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules (enabled);
+CREATE TABLE IF NOT EXISTS alert_events (
+  id           TEXT PRIMARY KEY,
+  rule_id      TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+  org_id       TEXT NOT NULL,
+  state        TEXT NOT NULL,
+  value        REAL,
+  threshold    REAL,
+  message      TEXT,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alert_events_rule ON alert_events (rule_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_alert_events_org ON alert_events (org_id, created_at);
 CREATE TABLE IF NOT EXISTS budgets (
   id           TEXT PRIMARY KEY,
   org_id       TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
@@ -198,6 +228,26 @@ CREATE TABLE IF NOT EXISTS deployments (
   created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_deployments_org ON deployments (org_id);
+CREATE TABLE IF NOT EXISTS managed_runners (
+  id            TEXT PRIMARY KEY,
+  org_id        TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  harness_id    TEXT,
+  deployment_id TEXT,
+  slug          TEXT,
+  driver        TEXT NOT NULL,
+  machine_id    TEXT,
+  region        TEXT,
+  image         TEXT,
+  status        TEXT NOT NULL DEFAULT 'provisioning',
+  url           TEXT,
+  detail        TEXT,
+  api_key_id    TEXT,
+  last_health_at INTEGER,
+  created_by    TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_managed_runners_org ON managed_runners (org_id);
 CREATE TABLE IF NOT EXISTS comments (
   id          TEXT PRIMARY KEY,
   harness_id  TEXT NOT NULL,
@@ -285,6 +335,11 @@ try {
   if (cc.length && !cc.includes("refresh")) db.exec("ALTER TABLE connections ADD COLUMN refresh TEXT");
   if (cc.length && !cc.includes("expires_at")) db.exec("ALTER TABLE connections ADD COLUMN expires_at INTEGER");
 } catch { /* fresh DB already has them */ }
+// backward-compat: the runner's scoped service key, for teardown revocation
+try {
+  const mr = db.prepare("PRAGMA table_info(managed_runners)").all().map((c) => c.name);
+  if (mr.length && !mr.includes("api_key_id")) db.exec("ALTER TABLE managed_runners ADD COLUMN api_key_id TEXT");
+} catch { /* fresh DB already has it */ }
 
 const uid = (p) => `${p}_${crypto.randomBytes(9).toString("base64url")}`;
 const now = () => Date.now();
@@ -933,6 +988,34 @@ export function listRuns(userId, { orgId, harnessId = null, limit = 50, before =
   return rows.map(_runSummary);
 }
 
+/* Trace search: richer filtering over runs than listRuns — status / failures,
+   a text query across input+output, latency/cost floors, and a time window.
+   Org-scoped; newest-first; cursor via `before`. */
+export function searchRuns(userId, { orgId, q = null, status = null, failed = false,
+    harnessId = null, from = null, to = null, minLatencyMs = null, minCost = null,
+    limit = 50, before = null } = {}) {
+  if (!orgId) throw new Error("orgId is required.");
+  if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const clauses = ["org_id = ?"]; const args = [orgId];
+  if (status) { clauses.push("status = ?"); args.push(status); }
+  if (failed) { clauses.push("status != 'ok'"); }
+  if (harnessId) { clauses.push("harness_id = ?"); args.push(harnessId); }
+  if (from != null) { clauses.push("created_at >= ?"); args.push(Number(from)); }
+  if (to != null) { clauses.push("created_at < ?"); args.push(Number(to)); }
+  if (minLatencyMs != null) { clauses.push("latency_ms >= ?"); args.push(Number(minLatencyMs)); }
+  if (minCost != null) { clauses.push("cost >= ?"); args.push(Number(minCost)); }
+  if (before != null) { clauses.push("created_at < ?"); args.push(Number(before)); }
+  if (q) {
+    clauses.push("(lower(input) LIKE ? OR lower(output) LIKE ?)");
+    const like = `%${String(q).toLowerCase()}%`; args.push(like, like);
+  }
+  const rows = db.prepare(`SELECT id, harness_id, harness_name, status, started_at, finished_at,
+      latency_ms, tokens_in, tokens_out, cost, created_at, created_by, substr(input,1,200) AS input_preview
+    FROM runs WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC LIMIT ?`).all(...args, lim);
+  return rows.map(_runSummary);
+}
+
 export function getRun(userId, runId) {
   const r = db.prepare("SELECT * FROM runs WHERE id = ?").get(runId);
   if (!r) throw new Error("Run not found.");
@@ -952,6 +1035,186 @@ function _runSummary(r) {
     createdAt: r.created_at, createdBy: r.created_by,
     inputPreview: r.input_preview !== undefined ? r.input_preview : (r.input || "").slice(0, 200),
   };
+}
+
+/* ── observability: aggregate metrics over the runs store ──
+   Powers the analytics dashboard (volume, success/error rate, latency
+   percentiles, token/cost over time) on top of the same per-run records the
+   trace viewer uses. Org-scoped (any member may read); runs are retention-
+   capped per org, so the percentile pass over latencies is bounded. */
+function _percentile(sorted, p) {
+  if (!sorted.length) return null;
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(p * sorted.length) - 1));
+  return sorted[idx];
+}
+
+export function metricsSummary(userId, { orgId, from = null, to = null, bucket = "day", harnessId = null } = {}) {
+  if (!orgId) throw new Error("orgId is required.");
+  if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  const toMs = Number(to) || now();
+  const fromMs = Number(from) || (toMs - 7 * 86400_000);
+  const bucketMs = bucket === "hour" ? 3600_000 : 86400_000;
+  const clauses = ["org_id = ?", "created_at >= ?", "created_at < ?"];
+  const args = [orgId, fromMs, toMs];
+  if (harnessId) { clauses.push("harness_id = ?"); args.push(harnessId); }
+  const where = clauses.join(" AND ");
+
+  const t = db.prepare(`SELECT COUNT(*) AS runs,
+      COALESCE(SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END),0) AS errors,
+      COALESCE(SUM(tokens_in),0) AS tokens_in, COALESCE(SUM(tokens_out),0) AS tokens_out,
+      COALESCE(SUM(cost),0) AS cost, AVG(latency_ms) AS avg_latency
+    FROM runs WHERE ${where}`).get(...args);
+
+  const lats = db.prepare(`SELECT latency_ms FROM runs WHERE ${where}
+      AND latency_ms IS NOT NULL ORDER BY latency_ms`).all(...args).map((r) => r.latency_ms);
+
+  const series = db.prepare(`SELECT CAST(created_at / ? AS INTEGER) * ? AS t, COUNT(*) AS runs,
+      COALESCE(SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END),0) AS errors,
+      COALESCE(SUM(cost),0) AS cost, COALESCE(SUM(tokens_in),0) AS tokens_in,
+      COALESCE(SUM(tokens_out),0) AS tokens_out, AVG(latency_ms) AS avg_latency
+    FROM runs WHERE ${where} GROUP BY t ORDER BY t`).all(bucketMs, bucketMs, ...args);
+
+  const byHarness = db.prepare(`SELECT harness_id, harness_name, COUNT(*) AS runs,
+      COALESCE(SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END),0) AS errors,
+      COALESCE(SUM(cost),0) AS cost
+    FROM runs WHERE ${where} GROUP BY harness_id, harness_name ORDER BY runs DESC LIMIT 10`).all(...args);
+
+  const runs = t.runs || 0;
+  return {
+    range: { from: fromMs, to: toMs, bucket },
+    totals: {
+      runs, errors: t.errors || 0,
+      successRate: runs ? (runs - (t.errors || 0)) / runs : null,
+      tokensIn: t.tokens_in || 0, tokensOut: t.tokens_out || 0, cost: t.cost || 0,
+      latencyAvg: t.avg_latency != null ? Math.round(t.avg_latency) : null,
+      latencyP50: _percentile(lats, 0.5), latencyP95: _percentile(lats, 0.95),
+    },
+    series: series.map((s) => ({
+      t: s.t, runs: s.runs, errors: s.errors, cost: s.cost,
+      tokensIn: s.tokens_in, tokensOut: s.tokens_out,
+      avgLatency: s.avg_latency != null ? Math.round(s.avg_latency) : null,
+    })),
+    byHarness: byHarness.map((h) => ({
+      harnessId: h.harness_id, harnessName: h.harness_name,
+      runs: h.runs, errors: h.errors, cost: h.cost,
+    })),
+  };
+}
+
+/* ── alerting: rules over the metrics, and the events they emit ──
+   A rule watches one metric over a lookback window and fires when it crosses a
+   threshold. Evaluation is server-side (no user) and records an event on each
+   state transition (ok→firing, firing→ok). Owner/admin manage rules; any member
+   may read rules + events. The evaluator (alerts.mjs) drives the no-user
+   helpers below. */
+const ALERT_METRICS = ["error_rate", "spend", "latency_p95", "run_count"];
+
+function _alertRule(r) {
+  return {
+    id: r.id, orgId: r.org_id, name: r.name, metric: r.metric, comparator: r.comparator,
+    threshold: r.threshold, windowMs: r.window_ms, harnessId: r.harness_id,
+    enabled: !!r.enabled, lastState: r.last_state,
+    lastEvaluatedAt: r.last_evaluated_at, lastTriggeredAt: r.last_triggered_at,
+    createdBy: r.created_by, createdAt: r.created_at,
+  };
+}
+
+export function createAlertRule(orgId, userId, { name, metric, comparator, threshold, windowMs, harnessId = null } = {}) {
+  const role = orgRoleFor(orgId, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage alerts.");
+  if (!name) throw new Error("An alert needs a name.");
+  if (!ALERT_METRICS.includes(metric)) throw new Error(`metric must be one of ${ALERT_METRICS.join(", ")}.`);
+  if (comparator !== ">" && comparator !== "<") throw new Error("comparator must be '>' or '<'.");
+  if (threshold == null || isNaN(Number(threshold))) throw new Error("threshold must be a number.");
+  if (!windowMs || Number(windowMs) <= 0) throw new Error("windowMs must be a positive number.");
+  const id = uid("alr");
+  db.prepare(`INSERT INTO alert_rules (id, org_id, name, metric, comparator, threshold, window_ms,
+      harness_id, enabled, last_state, created_by, created_at)
+    VALUES (?,?,?,?,?,?,?,?,1,'ok',?,?)`).run(
+    id, orgId, name, metric, comparator, Number(threshold), Number(windowMs),
+    harnessId || null, userId, now());
+  return _alertRule(db.prepare("SELECT * FROM alert_rules WHERE id = ?").get(id));
+}
+
+export function listAlertRules(orgId, userId) {
+  if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  return db.prepare("SELECT * FROM alert_rules WHERE org_id = ? ORDER BY created_at DESC").all(orgId).map(_alertRule);
+}
+
+export function updateAlertRule(userId, ruleId, patch = {}) {
+  const r = db.prepare("SELECT * FROM alert_rules WHERE id = ?").get(ruleId);
+  if (!r) throw new Error("Alert rule not found.");
+  const role = orgRoleFor(r.org_id, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage alerts.");
+  const next = {
+    name: patch.name ?? r.name,
+    comparator: patch.comparator ?? r.comparator,
+    threshold: patch.threshold != null ? Number(patch.threshold) : r.threshold,
+    window_ms: patch.windowMs != null ? Number(patch.windowMs) : r.window_ms,
+    harness_id: patch.harnessId !== undefined ? (patch.harnessId || null) : r.harness_id,
+    enabled: patch.enabled != null ? (patch.enabled ? 1 : 0) : r.enabled,
+  };
+  if (next.comparator !== ">" && next.comparator !== "<") throw new Error("comparator must be '>' or '<'.");
+  db.prepare(`UPDATE alert_rules SET name=?, comparator=?, threshold=?, window_ms=?, harness_id=?, enabled=?
+    WHERE id=?`).run(next.name, next.comparator, next.threshold, next.window_ms, next.harness_id, next.enabled, ruleId);
+  return _alertRule(db.prepare("SELECT * FROM alert_rules WHERE id = ?").get(ruleId));
+}
+
+export function deleteAlertRule(userId, ruleId) {
+  const r = db.prepare("SELECT * FROM alert_rules WHERE id = ?").get(ruleId);
+  if (!r) throw new Error("Alert rule not found.");
+  const role = orgRoleFor(r.org_id, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage alerts.");
+  db.prepare("DELETE FROM alert_rules WHERE id = ?").run(ruleId);
+  return { ok: true };
+}
+
+export function listAlertEvents(orgId, userId, { limit = 50 } = {}) {
+  if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  return db.prepare(`SELECT id, rule_id, org_id, state, value, threshold, message, created_at
+    FROM alert_events WHERE org_id = ? ORDER BY created_at DESC LIMIT ?`).all(orgId, lim)
+    .map((e) => ({ id: e.id, ruleId: e.rule_id, orgId: e.org_id, state: e.state,
+      value: e.value, threshold: e.threshold, message: e.message, createdAt: e.created_at }));
+}
+
+// ── server-side evaluator helpers (no user; driven by alerts.mjs) ──
+export function allEnabledAlertRules() {
+  return db.prepare("SELECT * FROM alert_rules WHERE enabled = 1").all().map(_alertRule);
+}
+
+export function alertAggregate(orgId, { windowMs, harnessId = null, now: nowMs = now() } = {}) {
+  const fromMs = nowMs - Number(windowMs || 0);
+  // the window ends inclusively at `now` so a run recorded in the same ms as
+  // evaluation is counted (a strict upper bound drops it, breaking fast ticks).
+  const clauses = ["org_id = ?", "created_at >= ?", "created_at <= ?"]; const args = [orgId, fromMs, nowMs];
+  if (harnessId) { clauses.push("harness_id = ?"); args.push(harnessId); }
+  const where = clauses.join(" AND ");
+  const t = db.prepare(`SELECT COUNT(*) AS runs,
+      COALESCE(SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END),0) AS errors,
+      COALESCE(SUM(cost),0) AS spend FROM runs WHERE ${where}`).get(...args);
+  const lats = db.prepare(`SELECT latency_ms FROM runs WHERE ${where}
+      AND latency_ms IS NOT NULL ORDER BY latency_ms`).all(...args).map((r) => r.latency_ms);
+  const runs = t.runs || 0;
+  return { runs, errors: t.errors || 0, errorRate: runs ? (t.errors || 0) / runs : 0,
+           spend: t.spend || 0, latencyP95: _percentile(lats, 0.95) };
+}
+
+export function recordAlertEvent(ruleId, orgId, { state, value = null, threshold = null, message = null } = {}) {
+  const id = uid("ale");
+  db.prepare(`INSERT INTO alert_events (id, rule_id, org_id, state, value, threshold, message, created_at)
+    VALUES (?,?,?,?,?,?,?,?)`).run(id, ruleId, orgId, state, value, threshold, message, now());
+  return { id };
+}
+
+export function setAlertRuleState(ruleId, { state, evaluatedAt = now(), triggeredAt = undefined } = {}) {
+  if (triggeredAt !== undefined) {
+    db.prepare("UPDATE alert_rules SET last_state=?, last_evaluated_at=?, last_triggered_at=? WHERE id=?")
+      .run(state, evaluatedAt, triggeredAt, ruleId);
+  } else {
+    db.prepare("UPDATE alert_rules SET last_state=?, last_evaluated_at=? WHERE id=?")
+      .run(state, evaluatedAt, ruleId);
+  }
 }
 
 /* ── budgets & quotas (per org; spend caps + request quotas) ──
@@ -1061,6 +1324,83 @@ export function deleteDeployment(orgId, userId, depId) {
   db.prepare("DELETE FROM deployments WHERE id = ? AND org_id = ?").run(depId, orgId);
   logAudit(orgId, userId, "deployment.delete", { targetType: "deployment", targetId: depId });
   return { deleted: true };
+}
+
+/* ── managed runners: Ergon-operated runner instances for a harness ──
+   A managed runner is a runner process Ergon launches and operates (via a
+   machines driver), as opposed to a deployment whose target_url the operator
+   runs themselves. The lifecycle service (hosting.mjs) drives these; once a
+   runner is ready it registers a deployment so the existing gateway routes to
+   it unchanged. Owner/admin provision + mutate; any member may read. */
+function _managedRunner(r) {
+  return {
+    id: r.id, orgId: r.org_id, harnessId: r.harness_id, deploymentId: r.deployment_id,
+    slug: r.slug, driver: r.driver, machineId: r.machine_id, region: r.region, image: r.image,
+    status: r.status, url: r.url, detail: r.detail, apiKeyId: r.api_key_id, lastHealthAt: r.last_health_at,
+    createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
+  };
+}
+
+export function createManagedRunner(orgId, userId, { harnessId = null, slug = null, driver, region = null, image = null } = {}) {
+  const role = orgRoleFor(orgId, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can provision runners.");
+  if (!driver) throw new Error("A machines driver is required.");
+  const id = uid("run");
+  const t = now();
+  db.prepare(`INSERT INTO managed_runners (id, org_id, harness_id, slug, driver, region, image, status, created_by, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,'provisioning',?,?,?)`).run(id, orgId, harnessId, slug, driver, region, image, userId, t, t);
+  logAudit(orgId, userId, "runner.provision", { targetType: "runner", targetId: id, detail: { harnessId, slug, driver } });
+  return _managedRunner(db.prepare("SELECT * FROM managed_runners WHERE id = ?").get(id));
+}
+
+export function getManagedRunner(userId, runnerId) {
+  const r = db.prepare("SELECT * FROM managed_runners WHERE id = ?").get(runnerId);
+  if (!r) throw new Error("Runner not found.");
+  if (!orgRoleFor(r.org_id, userId)) throw new Error("Not a member of this organization.");
+  return _managedRunner(r);
+}
+
+export function listManagedRunners(orgId, userId) {
+  if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  return db.prepare("SELECT * FROM managed_runners WHERE org_id = ? ORDER BY created_at DESC").all(orgId).map(_managedRunner);
+}
+
+// internal: the lifecycle service updates runner state (RBAC already enforced on entry)
+export function updateManagedRunner(runnerId, patch = {}) {
+  const r = db.prepare("SELECT * FROM managed_runners WHERE id = ?").get(runnerId);
+  if (!r) throw new Error("Runner not found.");
+  const f = {
+    deployment_id: patch.deploymentId !== undefined ? patch.deploymentId : r.deployment_id,
+    slug: patch.slug !== undefined ? patch.slug : r.slug,
+    machine_id: patch.machineId !== undefined ? patch.machineId : r.machine_id,
+    region: patch.region !== undefined ? patch.region : r.region,
+    image: patch.image !== undefined ? patch.image : r.image,
+    status: patch.status !== undefined ? patch.status : r.status,
+    url: patch.url !== undefined ? patch.url : r.url,
+    detail: patch.detail !== undefined ? patch.detail : r.detail,
+    api_key_id: patch.apiKeyId !== undefined ? patch.apiKeyId : r.api_key_id,
+    last_health_at: patch.lastHealthAt !== undefined ? patch.lastHealthAt : r.last_health_at,
+  };
+  db.prepare(`UPDATE managed_runners SET deployment_id=?, slug=?, machine_id=?, region=?, image=?, status=?, url=?, detail=?, api_key_id=?, last_health_at=?, updated_at=? WHERE id=?`)
+    .run(f.deployment_id, f.slug, f.machine_id, f.region, f.image, f.status, f.url, f.detail, f.api_key_id, f.last_health_at, now(), runnerId);
+  return _managedRunner(db.prepare("SELECT * FROM managed_runners WHERE id = ?").get(runnerId));
+}
+
+export function deleteManagedRunner(orgId, userId, runnerId) {
+  const role = orgRoleFor(orgId, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can remove runners.");
+  db.prepare("DELETE FROM managed_runners WHERE id = ? AND org_id = ?").run(runnerId, orgId);
+  logAudit(orgId, userId, "runner.delete", { targetType: "runner", targetId: runnerId });
+  return { deleted: true };
+}
+
+// internal: point a deployment at a (new) target + status — used on runner ready/restart/stop
+export function setDeploymentTarget(depId, { targetUrl, status } = {}) {
+  const d = db.prepare("SELECT * FROM deployments WHERE id = ?").get(depId);
+  if (!d) return null;
+  db.prepare("UPDATE deployments SET target_url = ?, status = ? WHERE id = ?")
+    .run(targetUrl !== undefined ? targetUrl : d.target_url, status !== undefined ? status : d.status, depId);
+  return { id: depId };
 }
 
 // internal: the gateway resolves a slug to a deployment (no RBAC — it key-auths)

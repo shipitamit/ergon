@@ -170,6 +170,26 @@ export const cloud = {
     return (await getJSON(`/api/runs?${qs.toString()}`)).runs;
   },
   async getRun(id) { return (await getJSON(`/api/runs/${encodeURIComponent(id)}`)).run; },
+  // observability: metrics, trace search, alerts
+  async metrics(orgId, { from, to, bucket, harnessId } = {}) {
+    const qs = new URLSearchParams({ orgId });
+    if (from != null) qs.set("from", String(from));
+    if (to != null) qs.set("to", String(to));
+    if (bucket) qs.set("bucket", bucket);
+    if (harnessId) qs.set("harnessId", harnessId);
+    return getJSON(`/api/metrics?${qs.toString()}`);
+  },
+  async searchRuns(orgId, opts = {}) {
+    const qs = new URLSearchParams({ orgId });
+    for (const [k, v] of Object.entries(opts)) if (v != null && v !== "") qs.set(k, String(v));
+    return (await getJSON(`/api/runs/search?${qs.toString()}`)).runs;
+  },
+  async alerts(orgId) { return (await getJSON(`/api/orgs/${encodeURIComponent(orgId)}/alerts`)).rules; },
+  async createAlert(orgId, body) { return (await sendJSON("POST", `/api/orgs/${encodeURIComponent(orgId)}/alerts`, body)).rule; },
+  async updateAlert(orgId, ruleId, body) { return (await sendJSON("PATCH", `/api/orgs/${encodeURIComponent(orgId)}/alerts/${encodeURIComponent(ruleId)}`, body)).rule; },
+  async deleteAlert(orgId, ruleId) { return sendJSON("DELETE", `/api/orgs/${encodeURIComponent(orgId)}/alerts/${encodeURIComponent(ruleId)}`); },
+  async alertEvents(orgId, { limit } = {}) { const q = limit != null ? `?limit=${limit}` : ""; return (await getJSON(`/api/orgs/${encodeURIComponent(orgId)}/alert-events${q}`)).events; },
+  async evaluateAlerts(orgId) { return (await sendJSON("POST", `/api/orgs/${encodeURIComponent(orgId)}/alerts/evaluate`, {})).transitions; },
   // budgets & quotas
   async budgets(orgId) { return (await getJSON(`/api/orgs/${encodeURIComponent(orgId)}/budgets`)).budgets; },
   async budgetStatus(orgId) { return (await getJSON(`/api/orgs/${encodeURIComponent(orgId)}/budgets/status`)).status; },
@@ -179,6 +199,15 @@ export const cloud = {
   async deployments(orgId) { return (await getJSON(`/api/orgs/${encodeURIComponent(orgId)}/deployments`)).deployments; },
   async createDeployment(orgId, slug, harnessId, targetUrl) { return (await sendJSON("POST", `/api/orgs/${encodeURIComponent(orgId)}/deployments`, { slug, harnessId, targetUrl })).deployment; },
   async deleteDeployment(orgId, id) { return sendJSON("DELETE", `/api/orgs/${encodeURIComponent(orgId)}/deployments/${encodeURIComponent(id)}`); },
+  // managed hosting (Ergon-operated runners)
+  async runners(orgId) { return (await getJSON(`/api/orgs/${encodeURIComponent(orgId)}/runners`)).runners; },
+  async provisionRunner(orgId, body) { return (await sendJSON("POST", `/api/orgs/${encodeURIComponent(orgId)}/runners`, body)).runner; },
+  async runner(orgId, id) { return (await getJSON(`/api/orgs/${encodeURIComponent(orgId)}/runners/${encodeURIComponent(id)}`)).runner; },
+  async stopRunner(orgId, id) { return (await sendJSON("POST", `/api/orgs/${encodeURIComponent(orgId)}/runners/${encodeURIComponent(id)}/stop`, {})).runner; },
+  async restartRunner(orgId, id) { return (await sendJSON("POST", `/api/orgs/${encodeURIComponent(orgId)}/runners/${encodeURIComponent(id)}/restart`, {})).runner; },
+  async refreshRunner(orgId, id) { return (await sendJSON("POST", `/api/orgs/${encodeURIComponent(orgId)}/runners/${encodeURIComponent(id)}/refresh`, {})).runner; },
+  async runnerLogs(orgId, id) { return (await getJSON(`/api/orgs/${encodeURIComponent(orgId)}/runners/${encodeURIComponent(id)}/logs`)).logs; },
+  async deleteRunner(orgId, id) { return sendJSON("DELETE", `/api/orgs/${encodeURIComponent(orgId)}/runners/${encodeURIComponent(id)}`); },
   // data governance
   async exportOrg(orgId) { return getJSON(`/api/orgs/${encodeURIComponent(orgId)}/export`); },
   // collaboration: node-anchored comments

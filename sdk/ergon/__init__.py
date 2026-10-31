@@ -44,7 +44,7 @@ from .tools import (
     web_search_tool,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __all__ = [
     "Agent", "AgentResult", "ApprovalPolicy", "ApprovalDenied",
     "ErgonError", "ProviderError", "RateLimitError", "TransientProviderError",

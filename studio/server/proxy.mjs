@@ -43,6 +43,14 @@ try {
       console.log("[proxy] schedule-trigger scheduler running.");
     } catch (e) { console.warn(`[proxy] scheduler not started: ${e.message}`); }
   }
+  // alert evaluator: periodically check alert rules and emit events on transitions
+  if (process.env.ERGON_ALERTS !== "off") {
+    try {
+      const { startAlertEvaluator } = await import("./alerts.mjs");
+      startAlertEvaluator(dbmod, { intervalMs: Number(process.env.ERGON_ALERTS_MS || 60_000) });
+      console.log("[proxy] alert evaluator running.");
+    } catch (e) { console.warn(`[proxy] alert evaluator not started: ${e.message}`); }
+  }
 } catch (e) {
   console.log("[proxy] running as pure model proxy (no accounts). To enable them: npm install better-sqlite3 bcryptjs");
 }

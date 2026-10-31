@@ -573,6 +573,8 @@ function costOf(model, inTok, outTok) {
 }
 const fmtCost = (c) => c >= 0.01 ? `$${c.toFixed(2)}` : c > 0 ? `$${c.toFixed(4)}` : "$0";
 const fmtTok = (t) => t >= 1000 ? `${(t / 1000).toFixed(1)}k` : String(t);
+// small pill-style action button (module-level so modals can share it)
+const pillBtn = (color = "#8D95A8") => ({ background: "transparent", border: `1px solid ${color}`, color, borderRadius: 5, padding: "3px 10px", fontSize: 10.5, cursor: "pointer", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" });
 
 // One call surface for the engine. Hosted search: Anthropic + Gemini.
 async function callModel(cfg, { system, messages, toolDefs = [], hostedSearch = false }, log) {
@@ -1174,6 +1176,308 @@ function RunsModal({ currentOrgId, onClose }) {
 
         {msg && <div style={{ fontSize: 11.5, color: C.output, marginTop: 12, fontFamily: MONO }}>{msg}</div>}
         <button onClick={onClose} style={{ marginTop: 14, width: "100%", background: C.panel2, border: `1px solid ${C.border}`, color: C.mut, borderRadius: 6, padding: "8px", fontSize: 12, cursor: "pointer" }}>Done</button>
+      </div>
+    </div>
+  );
+}
+
+/* ── analytics & alerts: dashboards over the runs store + alert rules ── */
+function MiniBars({ series, pick, color, label }) {
+  const vals = series.map(pick);
+  const max = Math.max(1, ...vals);
+  return (
+    <div>
+      <div style={{ fontSize: 10, fontFamily: MONO, letterSpacing: 1, textTransform: "uppercase", color: C.faint, marginBottom: 6 }}>{label}</div>
+      <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 70 }}>
+        {series.length === 0 && <div style={{ fontSize: 11, color: C.faint }}>no data in range</div>}
+        {series.map((s, i) => (
+          <div key={i} title={`${new Date(s.t).toLocaleString()} · ${pick(s)}`}
+               style={{ flex: 1, minWidth: 2, height: `${Math.max(2, (pick(s) / max) * 100)}%`, background: color, borderRadius: "2px 2px 0 0", opacity: 0.85 }} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AnalyticsModal({ currentOrgId, onClose }) {
+  const [orgs, setOrgs] = React.useState([]);
+  const [orgId, setOrgId] = React.useState(currentOrgId || null);
+  const [rangeKey, setRangeKey] = React.useState("7d");
+  const [m, setM] = React.useState(null);
+  const [tab, setTab] = React.useState("overview");   // overview | search | alerts
+  const [msg, setMsg] = React.useState(null);
+  // search
+  const [q, setQ] = React.useState("");
+  const [failedOnly, setFailedOnly] = React.useState(false);
+  const [hits, setHits] = React.useState([]);
+  // alerts
+  const [rules, setRules] = React.useState([]);
+  const [events, setEvents] = React.useState([]);
+  const [form, setForm] = React.useState({ name: "", metric: "error_rate", comparator: ">", threshold: "0.2", windowH: "24" });
+
+  const RANGES = { "24h": { ms: 86400000, bucket: "hour" }, "7d": { ms: 7 * 86400000, bucket: "day" }, "30d": { ms: 30 * 86400000, bucket: "day" } };
+
+  React.useEffect(() => { (async () => {
+    try { const o = await cloud.orgs(); setOrgs(o); if (!orgId && o.length) setOrgId(o[0].id); }
+    catch (e) { setMsg(e.message); }
+  })(); }, []);  // eslint-disable-line
+
+  const loadMetrics = async (oid = orgId, rk = rangeKey) => {
+    if (!oid) return;
+    const r = RANGES[rk]; const to = Date.now(); const from = to - r.ms;
+    try { setM(await cloud.metrics(oid, { from, to, bucket: r.bucket })); setMsg(null); }
+    catch (e) { setMsg(e.message); setM(null); }
+  };
+  const loadAlerts = async (oid = orgId) => {
+    if (!oid) return;
+    try { setRules(await cloud.alerts(oid)); setEvents(await cloud.alertEvents(oid, { limit: 20 })); }
+    catch (e) { setMsg(e.message); }
+  };
+  React.useEffect(() => { if (orgId) { loadMetrics(); loadAlerts(); setHits([]); } }, [orgId]);  // eslint-disable-line
+  React.useEffect(() => { loadMetrics(); }, [rangeKey]);  // eslint-disable-line
+
+  const runSearch = async () => {
+    try { setHits(await cloud.searchRuns(orgId, { q: q.trim() || undefined, failed: failedOnly || undefined, limit: 50 })); setMsg(null); }
+    catch (e) { setMsg(e.message); setHits([]); }
+  };
+  const createRule = async () => {
+    try {
+      await cloud.createAlert(orgId, {
+        name: form.name.trim() || `${form.metric} ${form.comparator} ${form.threshold}`,
+        metric: form.metric, comparator: form.comparator,
+        threshold: Number(form.threshold), windowMs: Number(form.windowH) * 3600000,
+      });
+      setForm({ ...form, name: "" }); await loadAlerts();
+    } catch (e) { setMsg(e.message); }
+  };
+  const toggleRule = async (r) => { try { await cloud.updateAlert(orgId, r.id, { enabled: !r.enabled }); await loadAlerts(); } catch (e) { setMsg(e.message); } };
+  const removeRule = async (r) => { try { await cloud.deleteAlert(orgId, r.id); await loadAlerts(); } catch (e) { setMsg(e.message); } };
+  const checkNow = async () => { try { await cloud.evaluateAlerts(orgId); await loadAlerts(); setMsg(null); } catch (e) { setMsg(e.message); } };
+
+  const t = m?.totals;
+  const pct = (x) => x == null ? "—" : `${Math.round(x * 100)}%`;
+  const statusColor = (s) => s === "ok" ? C.run : s === "cancelled" ? C.faint : C.output;
+  const tabBtn = (k, lbl) => (
+    <button onClick={() => setTab(k)} style={{ background: tab === k ? C.panel2 : "transparent", border: `1px solid ${tab === k ? C.border : "transparent"}`, color: tab === k ? C.text : C.mut, borderRadius: 6, padding: "4px 12px", fontSize: 12, cursor: "pointer", fontFamily: SANS }}>{lbl}</button>
+  );
+  const tile = (label, value, sub) => (
+    <div style={{ flex: "1 1 120px", minWidth: 110, background: C.panel2, border: `1px solid ${C.borderSoft}`, borderRadius: 8, padding: "10px 12px" }}>
+      <div style={{ fontSize: 10, fontFamily: MONO, letterSpacing: 1, textTransform: "uppercase", color: C.faint }}>{label}</div>
+      <div style={{ fontSize: 20, fontWeight: 700, marginTop: 3 }}>{value}</div>
+      {sub != null && <div style={{ fontSize: 11, color: C.faint, marginTop: 1 }}>{sub}</div>}
+    </div>
+  );
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(6,8,12,.7)", zIndex: 60, display: "flex", alignItems: "center", justifyContent: "center", padding: 30 }}>
+      <div className="ergon-modal" onClick={(e) => e.stopPropagation()} style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, width: "min(880px, 97vw)", maxHeight: "90vh", overflowY: "auto", padding: 22 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, gap: 10 }}>
+          <div style={{ fontWeight: 700, fontSize: 15 }}>Analytics &amp; alerts</div>
+          <select style={{ ...inputStyle, width: 200, marginBottom: 0 }} value={orgId || ""} onChange={(e) => setOrgId(e.target.value)}>
+            {orgs.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
+          </select>
+        </div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+          {tabBtn("overview", "Overview")}{tabBtn("search", "Trace search")}{tabBtn("alerts", "Alerts")}
+        </div>
+
+        {tab === "overview" && (
+          <div>
+            <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+              {Object.keys(RANGES).map((k) => (
+                <button key={k} onClick={() => setRangeKey(k)} style={{ background: rangeKey === k ? C.link : "transparent", color: rangeKey === k ? "#fff" : C.mut, border: `1px solid ${rangeKey === k ? C.link : C.border}`, borderRadius: 6, padding: "3px 10px", fontSize: 11.5, cursor: "pointer", fontFamily: MONO }}>{k}</button>
+              ))}
+            </div>
+            {!t && <div style={{ fontSize: 12, color: C.faint }}>No data yet.</div>}
+            {t && (
+              <div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+                  {tile("Runs", t.runs)}
+                  {tile("Success", pct(t.successRate), `${t.errors} error${t.errors === 1 ? "" : "s"}`)}
+                  {tile("Latency p50", t.latencyP50 != null ? `${t.latencyP50}ms` : "—", t.latencyP95 != null ? `p95 ${t.latencyP95}ms` : null)}
+                  {tile("Avg latency", t.latencyAvg != null ? `${t.latencyAvg}ms` : "—")}
+                  {tile("Cost", fmtCost(t.cost))}
+                  {tile("Tokens", (t.tokensIn + t.tokensOut).toLocaleString(), `${t.tokensIn}↓ ${t.tokensOut}↑`)}
+                </div>
+                <div style={{ display: "flex", gap: 20, marginBottom: 16, flexWrap: "wrap" }}>
+                  <div style={{ flex: "1 1 240px" }}><MiniBars series={m.series} pick={(s) => s.runs} color={C.link} label="Runs over time" /></div>
+                  <div style={{ flex: "1 1 240px" }}><MiniBars series={m.series} pick={(s) => s.errors} color={C.output} label="Errors over time" /></div>
+                  <div style={{ flex: "1 1 240px" }}><MiniBars series={m.series} pick={(s) => Math.round(s.cost * 10000) / 10000} color={C.run} label="Cost over time" /></div>
+                </div>
+                <div style={{ fontSize: 11, fontFamily: MONO, letterSpacing: 1, textTransform: "uppercase", color: C.faint, marginBottom: 6 }}>By harness</div>
+                {m.byHarness.length === 0 && <div style={{ fontSize: 12, color: C.faint }}>—</div>}
+                {m.byHarness.map((h) => (
+                  <div key={h.harnessId || "none"} style={{ display: "flex", gap: 10, alignItems: "center", padding: "5px 0", borderBottom: `1px solid ${C.borderSoft}`, fontSize: 12.5 }}>
+                    <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{h.harnessName || "(unnamed)"}</span>
+                    <span style={{ fontFamily: MONO, fontSize: 11, color: C.faint }}>{h.runs} runs · {h.errors} err · {fmtCost(h.cost)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === "search" && (
+          <div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 12, alignItems: "center" }}>
+              <input style={{ ...inputStyle, flex: 1, marginBottom: 0 }} placeholder="Search input & output text…" value={q}
+                     onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === "Enter" && runSearch()} />
+              <label style={{ fontSize: 12, color: C.mut, display: "flex", gap: 5, alignItems: "center", cursor: "pointer", whiteSpace: "nowrap" }}>
+                <input type="checkbox" checked={failedOnly} onChange={(e) => setFailedOnly(e.target.checked)} /> failures only
+              </label>
+              <button onClick={runSearch} style={{ background: C.link, color: "#fff", border: "none", borderRadius: 6, padding: "8px 14px", fontSize: 12, cursor: "pointer" }}>Search</button>
+            </div>
+            {hits.length === 0 && <div style={{ fontSize: 12, color: C.faint }}>No results — enter a query or toggle failures, then Search.</div>}
+            {hits.map((r) => (
+              <div key={r.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "7px 10px", marginBottom: 5, border: `1px solid ${C.borderSoft}`, borderRadius: 6 }}>
+                <span style={{ width: 8, height: 8, borderRadius: 8, background: statusColor(r.status), flex: "0 0 auto" }} />
+                <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12.5 }}>
+                  <b>{r.harnessName || "harness"}</b> <span style={{ color: C.faint }}>· {r.inputPreview || ""}</span>
+                </span>
+                <span style={{ fontFamily: MONO, fontSize: 10.5, color: C.faint, flex: "0 0 auto" }}>{r.latencyMs != null ? `${r.latencyMs}ms · ` : ""}{fmtCost(r.cost || 0)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {tab === "alerts" && (
+          <div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 12, padding: 10, background: C.panel2, borderRadius: 8, border: `1px solid ${C.borderSoft}` }}>
+              <input style={{ ...inputStyle, width: 130, marginBottom: 0 }} placeholder="name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+              <select style={{ ...inputStyle, width: 120, marginBottom: 0 }} value={form.metric} onChange={(e) => setForm({ ...form, metric: e.target.value })}>
+                <option value="error_rate">error_rate</option><option value="spend">spend</option>
+                <option value="latency_p95">latency_p95</option><option value="run_count">run_count</option>
+              </select>
+              <select style={{ ...inputStyle, width: 56, marginBottom: 0 }} value={form.comparator} onChange={(e) => setForm({ ...form, comparator: e.target.value })}>
+                <option value=">">&gt;</option><option value="<">&lt;</option>
+              </select>
+              <input style={{ ...inputStyle, width: 80, marginBottom: 0 }} placeholder="threshold" value={form.threshold} onChange={(e) => setForm({ ...form, threshold: e.target.value })} />
+              <span style={{ fontSize: 11.5, color: C.mut }}>over</span>
+              <input style={{ ...inputStyle, width: 52, marginBottom: 0 }} value={form.windowH} onChange={(e) => setForm({ ...form, windowH: e.target.value })} />
+              <span style={{ fontSize: 11.5, color: C.mut }}>h</span>
+              <button onClick={createRule} style={{ background: C.run, color: "#fff", border: "none", borderRadius: 6, padding: "8px 12px", fontSize: 12, cursor: "pointer" }}>Add rule</button>
+              <button onClick={checkNow} style={{ background: "transparent", color: C.link, border: `1px solid ${C.border}`, borderRadius: 6, padding: "8px 12px", fontSize: 12, cursor: "pointer" }}>Check now</button>
+            </div>
+            {rules.length === 0 && <div style={{ fontSize: 12, color: C.faint, marginBottom: 12 }}>No alert rules yet.</div>}
+            {rules.map((r) => (
+              <div key={r.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 0", borderBottom: `1px solid ${C.borderSoft}`, fontSize: 12.5 }}>
+                <span style={{ width: 8, height: 8, borderRadius: 8, background: r.lastState === "firing" ? C.output : C.run, flex: "0 0 auto" }} title={r.lastState} />
+                <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  <b>{r.name}</b> <span style={{ color: C.faint, fontFamily: MONO, fontSize: 11 }}>{r.metric} {r.comparator} {r.threshold} / {Math.round(r.windowMs / 3600000)}h</span>
+                </span>
+                <button onClick={() => toggleRule(r)} style={{ background: "transparent", border: `1px solid ${C.border}`, color: r.enabled ? C.run : C.faint, borderRadius: 5, padding: "2px 8px", fontSize: 10.5, cursor: "pointer", fontFamily: MONO }}>{r.enabled ? "on" : "off"}</button>
+                <button onClick={() => removeRule(r)} style={{ background: "transparent", border: "none", color: C.faint, cursor: "pointer", fontSize: 14 }}>×</button>
+              </div>
+            ))}
+            {events.length > 0 && (
+              <div style={{ marginTop: 14 }}>
+                <div style={{ fontSize: 11, fontFamily: MONO, letterSpacing: 1, textTransform: "uppercase", color: C.faint, marginBottom: 6 }}>Recent events</div>
+                {events.map((e) => (
+                  <div key={e.id} style={{ display: "flex", gap: 8, padding: "3px 0", fontSize: 11.5, fontFamily: MONO }}>
+                    <span style={{ color: e.state === "firing" ? C.output : C.run, width: 62, flex: "0 0 auto" }}>{e.state}</span>
+                    <span style={{ color: C.mut, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.message}</span>
+                    <span style={{ color: C.faint, flex: "0 0 auto" }}>{new Date(e.createdAt).toLocaleTimeString()}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {msg && <div style={{ fontSize: 11.5, color: C.output, marginTop: 12, fontFamily: MONO }}>{msg}</div>}
+        <button onClick={onClose} style={{ marginTop: 16, width: "100%", background: C.panel2, border: `1px solid ${C.border}`, color: C.mut, borderRadius: 6, padding: "8px", fontSize: 12, cursor: "pointer" }}>Done</button>
+      </div>
+    </div>
+  );
+}
+
+/* ── managed hosting: provision & operate Ergon-run runners for a harness ── */
+function HostingModal({ currentOrgId, currentHarnessId, onClose }) {
+  const [orgs, setOrgs] = React.useState([]);
+  const [orgId, setOrgId] = React.useState(currentOrgId || null);
+  const [harnesses, setHarnesses] = React.useState([]);
+  const [runners, setRunners] = React.useState([]);
+  const [form, setForm] = React.useState({ harnessId: currentHarnessId || "", slug: "", region: "", image: "" });
+  const [logsFor, setLogsFor] = React.useState(null);   // {id, lines}
+  const [busy, setBusy] = React.useState(false);
+  const [msg, setMsg] = React.useState(null);
+
+  React.useEffect(() => { (async () => {
+    try { const o = await cloud.orgs(); setOrgs(o); if (!orgId && o.length) setOrgId(o[0].id);
+          setHarnesses(await cloud.list()); }
+    catch (e) { setMsg(e.message); }
+  })(); }, []);  // eslint-disable-line
+  const load = async (oid = orgId) => { if (!oid) return; try { setRunners(await cloud.runners(oid)); setMsg(null); } catch (e) { setMsg(e.message); setRunners([]); } };
+  React.useEffect(() => { if (orgId) load(orgId); }, [orgId]);  // eslint-disable-line
+
+  const orgHarnesses = harnesses.filter((h) => !h.orgId || !orgId || h.orgId === orgId);
+  const statusColor = (s) => s === "ready" ? C.run : s === "provisioning" ? C.agent : s === "error" ? C.output : C.faint;
+
+  const deploy = async () => {
+    if (!form.slug.trim()) { setMsg("A slug is required — the gateway routes by it."); return; }
+    setBusy(true);
+    try {
+      await cloud.provisionRunner(orgId, {
+        harnessId: form.harnessId || null, slug: form.slug.trim().toLowerCase(),
+        region: form.region.trim() || undefined, image: form.image.trim() || undefined,
+      });
+      setForm({ ...form, slug: "" }); await load(); setMsg(null);
+    } catch (e) { setMsg(e.message); } finally { setBusy(false); }
+  };
+  const act = async (fn, id) => { setBusy(true); try { await fn(orgId, id); await load(); setMsg(null); } catch (e) { setMsg(e.message); } finally { setBusy(false); } };
+  const showLogs = async (id) => { try { setLogsFor({ id, lines: await cloud.runnerLogs(orgId, id) }); } catch (e) { setMsg(e.message); } };
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(6,8,12,.7)", zIndex: 60, display: "flex", alignItems: "center", justifyContent: "center", padding: 30 }}>
+      <div className="ergon-modal" onClick={(e) => e.stopPropagation()} style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, width: "min(860px, 97vw)", maxHeight: "90vh", overflowY: "auto", padding: 22 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6, gap: 10 }}>
+          <div style={{ fontWeight: 700, fontSize: 15 }}>☁️ Deploy to Ergon Cloud</div>
+          <select style={{ ...inputStyle, width: 200, marginBottom: 0 }} value={orgId || ""} onChange={(e) => setOrgId(e.target.value)}>
+            {orgs.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
+          </select>
+        </div>
+        <div style={{ fontSize: 11.5, color: C.faint, marginBottom: 14, lineHeight: 1.5 }}>
+          Ergon launches and operates a runner for your harness. Once it's healthy, its public endpoint is
+          <span style={{ fontFamily: MONO }}> /api/gw/&lt;slug&gt;/run</span> — the same gateway your triggers and webhooks already use.
+        </div>
+
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 16, padding: 12, background: C.panel2, borderRadius: 8, border: `1px solid ${C.borderSoft}` }}>
+          <select style={{ ...inputStyle, width: 180, marginBottom: 0 }} value={form.harnessId} onChange={(e) => setForm({ ...form, harnessId: e.target.value })}>
+            <option value="">(no harness)</option>
+            {orgHarnesses.map((h) => <option key={h.id} value={h.id}>{h.name || h.id}</option>)}
+          </select>
+          <input style={{ ...inputStyle, width: 150, marginBottom: 0 }} placeholder="slug (e.g. bot-prod)" value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} />
+          <input style={{ ...inputStyle, width: 90, marginBottom: 0 }} placeholder="region" value={form.region} onChange={(e) => setForm({ ...form, region: e.target.value })} />
+          <input style={{ ...inputStyle, width: 150, marginBottom: 0 }} placeholder="image (optional)" value={form.image} onChange={(e) => setForm({ ...form, image: e.target.value })} />
+          <button onClick={deploy} disabled={busy} style={{ background: C.run, color: "#fff", border: "none", borderRadius: 6, padding: "8px 16px", fontSize: 12, cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1 }}>Deploy</button>
+        </div>
+
+        {runners.length === 0 && <div style={{ fontSize: 12, color: C.faint }}>No managed runners yet. Pick a harness, give it a slug, and Deploy.</div>}
+        {runners.map((r) => (
+          <div key={r.id} style={{ border: `1px solid ${C.borderSoft}`, borderRadius: 7, padding: "8px 11px", marginBottom: 7 }}>
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <span style={{ width: 9, height: 9, borderRadius: 9, background: statusColor(r.status), flex: "0 0 auto" }} title={r.status} />
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <b style={{ fontSize: 13 }}>{r.slug || r.id}</b>
+                <span style={{ color: C.faint, fontFamily: MONO, fontSize: 10.5 }}> · {r.status}{r.url ? ` · ${r.url}` : ""}</span>
+                <div style={{ color: C.faint, fontFamily: MONO, fontSize: 10, marginTop: 1 }}>{r.driver}{r.machineId ? ` · ${r.machineId}` : ""}{r.detail ? ` · ${r.detail}` : ""}</div>
+              </span>
+            </div>
+            <div style={{ display: "flex", gap: 6, marginTop: 7, flexWrap: "wrap" }}>
+              {r.status === "provisioning" && <button onClick={() => act(cloud.refreshRunner, r.id)} disabled={busy} style={pillBtn(C.link)}>Refresh</button>}
+              {r.status !== "stopped" && <button onClick={() => act(cloud.stopRunner, r.id)} disabled={busy} style={pillBtn(C.mut)}>Stop</button>}
+              <button onClick={() => act(cloud.restartRunner, r.id)} disabled={busy} style={pillBtn(C.mut)}>Restart</button>
+              <button onClick={() => showLogs(r.id)} disabled={busy} style={pillBtn(C.mut)}>Logs</button>
+              <button onClick={() => act(cloud.deleteRunner, r.id)} disabled={busy} style={pillBtn(C.output)}>Delete</button>
+            </div>
+            {logsFor && logsFor.id === r.id && (
+              <pre style={{ margin: "8px 0 0", padding: 8, background: C.bg, borderRadius: 6, fontFamily: MONO, fontSize: 10.5, whiteSpace: "pre-wrap", color: C.mut, maxHeight: 160, overflowY: "auto" }}>{(logsFor.lines || []).join("\n") || "(no logs)"}</pre>
+            )}
+          </div>
+        ))}
+
+        {msg && <div style={{ fontSize: 11.5, color: C.output, marginTop: 12, fontFamily: MONO }}>{msg}</div>}
+        <button onClick={onClose} style={{ marginTop: 16, width: "100%", background: C.panel2, border: `1px solid ${C.border}`, color: C.mut, borderRadius: 6, padding: "8px", fontSize: 12, cursor: "pointer" }}>Done</button>
       </div>
     </div>
   );
@@ -2369,6 +2673,8 @@ export default function ErgonStudio() {
   const [keysOpen, setKeysOpen] = useState(false);
   const [orgsOpen, setOrgsOpen] = useState(false);
   const [runsOpen, setRunsOpen] = useState(false);
+  const [analyticsOpen, setAnalyticsOpen] = useState(false);
+  const [hostingOpen, setHostingOpen] = useState(false);
   const [modelOpts, setModelOpts] = useState({});    // prefix -> [model ids]
   const [modelMsg, setModelMsg] = useState({});      // prefix -> status string
   const refreshCatalog = useCallback(() => { fetchProviderCatalog().then(setProviderCatalog); }, []);
@@ -2823,6 +3129,8 @@ export default function ErgonStudio() {
               {!IN_CLAUDE_ARTIFACT && <button style={menuItem()} onClick={() => { setMoreOpen(false); setKeysOpen(true); }}>Provider keys…</button>}
               {signedIn && !IN_CLAUDE_ARTIFACT && <button style={menuItem()} onClick={() => { setMoreOpen(false); setOrgsOpen(true); }}>Organizations…</button>}
               {signedIn && !IN_CLAUDE_ARTIFACT && <button style={menuItem()} onClick={() => { setMoreOpen(false); setRunsOpen(true); }}>Run history…</button>}
+              {signedIn && !IN_CLAUDE_ARTIFACT && <button style={menuItem(C.link)} onClick={() => { setMoreOpen(false); setAnalyticsOpen(true); }}>📊 Analytics &amp; alerts…</button>}
+              {signedIn && !IN_CLAUDE_ARTIFACT && <button style={menuItem(C.run)} onClick={() => { setMoreOpen(false); setHostingOpen(true); }}>☁️ Deploy to Ergon Cloud…</button>}
               {signedIn && !!currentId && !IN_CLAUDE_ARTIFACT && <button style={menuItem()} onClick={() => { setMoreOpen(false); openHistory(); }}>⟲ Version history…</button>}
               {signedIn && !!currentId && !IN_CLAUDE_ARTIFACT && <button style={menuItem(C.run)} onClick={() => { setMoreOpen(false); openTriggers(); }}>⚡ Triggers — webhook &amp; schedule…</button>}
               {signedIn && !IN_CLAUDE_ARTIFACT && <button style={menuItem(C.tool)} onClick={() => { setMoreOpen(false); openConnectors(); }}>🔌 Connectors &amp; connections…</button>}
@@ -3995,6 +4303,8 @@ export default function ErgonStudio() {
       {keysOpen && !IN_CLAUDE_ARTIFACT && <KeysModal catalog={providerCatalog} onClose={() => setKeysOpen(false)} onChanged={refreshCatalog} />}
       {orgsOpen && !IN_CLAUDE_ARTIFACT && <OrgsModal currentHarnessId={currentId} currentOrgId={currentOrgId} onClose={() => setOrgsOpen(false)} onMoved={setCurrentOrgId} onChanged={() => loadLibrary(true)} />}
       {runsOpen && !IN_CLAUDE_ARTIFACT && <RunsModal currentOrgId={currentOrgId} onClose={() => setRunsOpen(false)} />}
+      {analyticsOpen && !IN_CLAUDE_ARTIFACT && <AnalyticsModal currentOrgId={currentOrgId} onClose={() => setAnalyticsOpen(false)} />}
+      {hostingOpen && !IN_CLAUDE_ARTIFACT && <HostingModal currentOrgId={currentOrgId} currentHarnessId={currentHarnessId} onClose={() => setHostingOpen(false)} />}
       {authOpen && <AuthModal onClose={() => setAuthOpen(false)} onAuthed={onAuthed} />}
 
       {connOpen && (() => {

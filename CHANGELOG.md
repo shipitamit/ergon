@@ -7,6 +7,61 @@ together (see [Versioning](#versioning)). This project adheres to
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-31
+
+Observability & managed hosting. Turns run data into an analytics, trace-search
+and alerting surface, and lets Ergon operate a harness's runner itself (managed
+cloud, MVP) instead of only routing to a self-run one — the two biggest gaps vs
+the market-leading platforms.
+
+### Added
+- **Managed hosting (MVP).** Ergon can now operate a harness's
+  runner itself, not just route to one the operator runs. A `managed_runners`
+  store (both backends) plus a driver-agnostic lifecycle service (`hosting.mjs`):
+  `provision` launches a runner through a **machines driver**, health-gates it,
+  and — once ready — registers a deployment so the existing tenant-aware gateway
+  (`POST /api/gw/:slug/run`) routes to it unchanged; `refresh` promotes a
+  still-starting runner; `stop`/`restart` park and re-activate the deployment.
+  Drivers: an in-memory `FakeMachinesDriver` (zero-infra default, also the test
+  backend) and a `FlyMachinesDriver` (Fly.io Machines REST via an injectable
+  HTTP transport, so its request shaping is tested offline), behind
+  `makeMachinesDriver`. Endpoints under `/api/orgs/:id/runners` (owner/admin to
+  mutate, members read). Config: `ERGON_HOSTING_DRIVER=fly` + `FLY_APP` /
+  `FLY_API_TOKEN`; defaults to the fake driver. A Studio **"Deploy to Ergon
+  Cloud"** view provisions a runner for a harness and shows status, URL, logs,
+  and stop/restart/refresh/delete controls. **Secret provisioning** follows the
+  Python export's model: rather than baking credentials into the machine image,
+  a runner boots with a scoped, org-bound service API key + the server URL (and
+  the list of connections its harness references) and resolves each connection's
+  live material at run time via the existing key-authenticated resolver — no
+  plaintext secret is written into the image or env. The scoped key is tracked
+  on the runner and **revoked on teardown** (and if provisioning fails), so a
+  removed or failed runner never leaves a live credential behind; `remove` also
+  stops the machine and parks the deployment.
+- **Observability — analytics & alerting (server-side).** Three additions over
+  the runs store, both backends:
+  - **Metrics API.** Org-scoped `metricsSummary` (`GET /api/metrics`): totals
+    (run volume, error count + success rate, token and cost sums, average and
+    p50/p95 latency), a time-bucketed series (`day`/`hour`) for trends, and a
+    by-harness breakdown — all honouring a `from`/`to` window and a harness
+    filter. (SQLite computes percentiles in JS over the retention-capped set;
+    Postgres uses `percentile_cont`.)
+  - **Trace search.** `searchRuns` (`GET /api/runs/search`): filter runs by a
+    text query across input+output, exact status or any failure, latency and
+    cost floors, time window, harness, with cursor pagination.
+  - **Alert rules.** Per-org rules that watch a metric (`error_rate`, `spend`,
+    `latency_p95`, `run_count`) over a lookback window and fire when it crosses
+    a threshold. Owner/admin CRUD (`/api/orgs/:id/alerts`), member-readable
+    events (`/api/orgs/:id/alert-events`), and a backend-agnostic evaluator
+    (`alerts.mjs`) that records an event only on a state transition
+    (ok↔firing) and runs on an in-process interval.
+  - **Studio dashboard.** An "Analytics & alerts" view (signed-in) over the
+    above: an Overview with metric tiles (runs, success rate, latency p50/p95,
+    cost, tokens), runs/errors/cost sparkline trends and a by-harness table with
+    a 24h/7d/30d range; a Trace-search tab (text query + failures-only); and an
+    Alerts tab to create/toggle/delete rules, run an on-demand check, and read
+    recent alert events.
+
 ## [0.4.0] — 2026-10-27
 
 Durable runtime & production RAG. Makes multi-node flows and the trigger
@@ -145,7 +200,8 @@ code and the runtime in sync. Database changes ship as forward-only migrations
 (`studio/server/migrations.mjs`, currently 0001–0011); newer tables (triggers,
 connections, version history) are also created idempotently at startup.
 
-[Unreleased]: https://example.com/ergon/compare/v0.4.0...HEAD
+[Unreleased]: https://example.com/ergon/compare/v0.5.0...HEAD
+[0.5.0]: https://example.com/ergon/compare/v0.4.0...v0.5.0
 [0.4.0]: https://example.com/ergon/compare/v0.3.0...v0.4.0
 [0.3.0]: https://example.com/ergon/compare/v0.2.0...v0.3.0
 [0.2.0]: https://example.com/ergon/releases/tag/v0.2.0
