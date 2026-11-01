@@ -7,6 +7,52 @@ together (see [Versioning](#versioning)). This project adheres to
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-11-01
+
+Trust & operations. Rounds out the operability layer on top of 0.5.0's
+observability + managed hosting: safety guardrails, human-in-the-loop approvals,
+alert delivery, and eval-at-scale — the mechanical gaps that separate a capable
+builder from one teams run in production.
+
+### Added
+- **Eval at scale.** Beyond the SDK's CI gate: named **eval datasets** per org
+  (cases of `{input, expected, scorer}`) and stored, **scored runs** with a
+  per-case breakdown and aggregate pass-rate/score. A deterministic server
+  scorer (`eval-score.mjs`: exact / contains / not_contains / regex / numeric /
+  json_valid, mirroring the SDK's) scores a run on record; `compareEvalRuns`
+  surfaces **regressions and fixes** between two runs by case. Both backends,
+  routes under `/api/orgs/:id/eval/*`, and a Studio **Evals** view (manage a
+  dataset's cases, see pass-rate per run, drill into per-case results, compare
+  the latest two). Runs are pushed via the API (`recordEvalRun`) from the SDK/CI.
+- **Human-in-the-loop approval inbox.** A running agent (or a deployed runner,
+  via its org key) can file an **approval request** and wait; a person reviews it
+  in a Studio **Approvals inbox** and approves/rejects with a note. Per-org
+  `approval_requests` store (both backends) with file / list / get / decide and
+  pending-expiry; routes under `/api/orgs/:id/approvals` (members and runner keys
+  file + poll, only a signed-in human decides). A new SDK `ApprovalClient`
+  (`from_env()` on a managed runner) files and polls until decided — injectable
+  HTTP + sleep, so the loop is offline-tested. This is the out-of-band
+  counterpart to the in-process `ApprovalPolicy`.
+- **Guardrails (SDK).** Drop-in safety checks attachable to an Agent via
+  `input_guards=` (on the prompt, before the model) and `output_guards=` (on the
+  final answer): `PIIGuard` (detect + redact emails/phones/cards[Luhn]/SSNs/
+  IPs/API-keys), `ModerationGuard` (pattern blocklist or an injected model
+  `classifier`), and `SchemaGuard` (output parses as JSON and matches a minimal
+  JSON-schema shape). Each guard's `action` is redact / flag / block — a blocked
+  input short-circuits before any model call, a blocked output is withheld; all
+  deterministic and dependency-free, with `redact_pii` / `find_pii` /
+  `apply_guards` usable standalone. Findings are logged to the session.
+- **Alert delivery.** Alert rule transitions are now *sent*, not just recorded.
+  Per-org **delivery channels** (webhook — structured JSON; Slack — incoming
+  webhook) with owner/admin CRUD (`/api/orgs/:id/alert-channels`), a per-channel
+  **test** ping, and a best-effort delivery module (`alert-delivery.mjs`, both
+  over plain HTTPS POST so it's unit-tested offline). On each ok↔firing
+  transition the evaluator fans out to the org's enabled channels — on the
+  in-process tick and on a manual `…/alerts/evaluate` — so one failing channel
+  never blocks the others. Studio gains a **Delivery channels** section in the
+  Analytics → Alerts tab (add / test / delete). Email remains out (needs an SMTP
+  provider; a webhook into an email service covers it meanwhile).
+
 ## [0.5.0] — 2026-10-31
 
 Observability & managed hosting. Turns run data into an analytics, trace-search
@@ -200,7 +246,8 @@ code and the runtime in sync. Database changes ship as forward-only migrations
 (`studio/server/migrations.mjs`, currently 0001–0011); newer tables (triggers,
 connections, version history) are also created idempotently at startup.
 
-[Unreleased]: https://example.com/ergon/compare/v0.5.0...HEAD
+[Unreleased]: https://example.com/ergon/compare/v0.6.0...HEAD
+[0.6.0]: https://example.com/ergon/compare/v0.5.0...v0.6.0
 [0.5.0]: https://example.com/ergon/compare/v0.4.0...v0.5.0
 [0.4.0]: https://example.com/ergon/compare/v0.3.0...v0.4.0
 [0.3.0]: https://example.com/ergon/compare/v0.2.0...v0.3.0

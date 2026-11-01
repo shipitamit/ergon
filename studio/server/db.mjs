@@ -21,6 +21,7 @@ import { nextFireAfter, isValidCron } from "./cron.mjs";
 import { seal, open as unseal, last4 as _last4 } from "./cryptobox.mjs";
 import { getConnector, validateConnection, materialize } from "./connectors.mjs";
 import { oauthConfigFor, refreshTokens, isExpired } from "./oauth-connections.mjs";
+import { scoreDataset } from "./eval-score.mjs";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DB_PATH = process.env.ERGON_DB || path.join(ROOT, "ergon.db");
@@ -206,6 +207,58 @@ CREATE TABLE IF NOT EXISTS alert_events (
 );
 CREATE INDEX IF NOT EXISTS idx_alert_events_rule ON alert_events (rule_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_alert_events_org ON alert_events (org_id, created_at);
+CREATE TABLE IF NOT EXISTS alert_channels (
+  id           TEXT PRIMARY KEY,
+  org_id       TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  type         TEXT NOT NULL,
+  target       TEXT NOT NULL,
+  config       TEXT,
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  created_by   TEXT,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alert_channels_org ON alert_channels (org_id);
+CREATE TABLE IF NOT EXISTS approval_requests (
+  id           TEXT PRIMARY KEY,
+  org_id       TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  harness_id   TEXT,
+  run_id       TEXT,
+  title        TEXT NOT NULL,
+  detail       TEXT,
+  status       TEXT NOT NULL DEFAULT 'pending',
+  requested_by TEXT,
+  decided_by   TEXT,
+  decision_note TEXT,
+  expires_at   INTEGER,
+  created_at   INTEGER NOT NULL,
+  decided_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_org_status ON approval_requests (org_id, status, created_at);
+CREATE TABLE IF NOT EXISTS eval_datasets (
+  id          TEXT PRIMARY KEY,
+  org_id      TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  harness_id  TEXT,
+  name        TEXT NOT NULL,
+  cases       TEXT,
+  created_by  TEXT,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eval_datasets_org ON eval_datasets (org_id);
+CREATE TABLE IF NOT EXISTS eval_runs (
+  id          TEXT PRIMARY KEY,
+  org_id      TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  dataset_id  TEXT,
+  harness_id  TEXT,
+  label       TEXT,
+  total       INTEGER NOT NULL DEFAULT 0,
+  passed      INTEGER NOT NULL DEFAULT 0,
+  score_avg   REAL NOT NULL DEFAULT 0,
+  results     TEXT,
+  created_by  TEXT,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eval_runs_org ON eval_runs (org_id, dataset_id, created_at);
 CREATE TABLE IF NOT EXISTS budgets (
   id           TEXT PRIMARY KEY,
   org_id       TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
@@ -1215,6 +1268,230 @@ export function setAlertRuleState(ruleId, { state, evaluatedAt = now(), triggere
     db.prepare("UPDATE alert_rules SET last_state=?, last_evaluated_at=? WHERE id=?")
       .run(state, evaluatedAt, ruleId);
   }
+}
+
+/* ── alert delivery channels (where a transition is sent) ──
+   webhook / slack endpoints per org. Owner/admin manage; members read. The
+   evaluator uses enabledAlertChannels (no RBAC — server-side). */
+const ALERT_CHANNEL_TYPES = ["webhook", "slack"];
+
+function _alertChannel(r) {
+  let config = {}; try { config = r.config ? JSON.parse(r.config) : {}; } catch { /* ignore */ }
+  return { id: r.id, orgId: r.org_id, type: r.type, target: r.target, config,
+           enabled: !!r.enabled, createdBy: r.created_by, createdAt: r.created_at };
+}
+
+export function createAlertChannel(orgId, userId, { type, target, config = {} } = {}) {
+  const role = orgRoleFor(orgId, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage alert channels.");
+  if (!ALERT_CHANNEL_TYPES.includes(type)) throw new Error(`type must be one of ${ALERT_CHANNEL_TYPES.join(", ")}.`);
+  if (!/^https:\/\//.test(String(target || ""))) throw new Error("target must be an https URL.");
+  const id = uid("ach");
+  db.prepare(`INSERT INTO alert_channels (id, org_id, type, target, config, enabled, created_by, created_at)
+    VALUES (?,?,?,?,?,1,?,?)`).run(id, orgId, type, target, JSON.stringify(config || {}), userId, now());
+  logAudit(orgId, userId, "alertchannel.create", { targetType: "alertchannel", targetId: id, detail: { type } });
+  return _alertChannel(db.prepare("SELECT * FROM alert_channels WHERE id = ?").get(id));
+}
+
+export function listAlertChannels(orgId, userId) {
+  if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  return db.prepare("SELECT * FROM alert_channels WHERE org_id = ? ORDER BY created_at DESC").all(orgId).map(_alertChannel);
+}
+
+export function updateAlertChannel(userId, channelId, patch = {}) {
+  const r = db.prepare("SELECT * FROM alert_channels WHERE id = ?").get(channelId);
+  if (!r) throw new Error("Alert channel not found.");
+  const role = orgRoleFor(r.org_id, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage alert channels.");
+  const target = patch.target !== undefined ? patch.target : r.target;
+  if (!/^https:\/\//.test(String(target || ""))) throw new Error("target must be an https URL.");
+  db.prepare("UPDATE alert_channels SET target=?, config=?, enabled=? WHERE id=?").run(
+    target,
+    patch.config !== undefined ? JSON.stringify(patch.config || {}) : r.config,
+    patch.enabled != null ? (patch.enabled ? 1 : 0) : r.enabled, channelId);
+  return _alertChannel(db.prepare("SELECT * FROM alert_channels WHERE id = ?").get(channelId));
+}
+
+export function deleteAlertChannel(userId, channelId) {
+  const r = db.prepare("SELECT * FROM alert_channels WHERE id = ?").get(channelId);
+  if (!r) throw new Error("Alert channel not found.");
+  const role = orgRoleFor(r.org_id, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage alert channels.");
+  db.prepare("DELETE FROM alert_channels WHERE id = ?").run(channelId);
+  return { deleted: true };
+}
+
+// internal: enabled channels for an org (server-side delivery; no RBAC)
+export function enabledAlertChannels(orgId) {
+  return db.prepare("SELECT * FROM alert_channels WHERE org_id = ? AND enabled = 1").all(orgId).map(_alertChannel);
+}
+
+/* ── human-in-the-loop approval inbox ──
+   A running agent (or a runner, via its org key) files an approval request and
+   waits; a person reviews it in the inbox and approves/rejects. Org-scoped: any
+   member may file, read, and decide. */
+function _approval(r) {
+  let detail = r.detail; try { detail = r.detail ? JSON.parse(r.detail) : null; } catch { /* keep string */ }
+  return { id: r.id, orgId: r.org_id, harnessId: r.harness_id, runId: r.run_id, title: r.title,
+    detail, status: r.status, requestedBy: r.requested_by, decidedBy: r.decided_by,
+    decisionNote: r.decision_note, expiresAt: r.expires_at, createdAt: r.created_at, decidedAt: r.decided_at };
+}
+
+export function createApprovalRequest(orgId, userId, { harnessId = null, runId = null, title, detail = null, expiresAt = null } = {}) {
+  if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  if (!title || !String(title).trim()) throw new Error("An approval request needs a title.");
+  const id = uid("apr");
+  const det = detail == null ? null : (typeof detail === "string" ? detail : JSON.stringify(detail));
+  db.prepare(`INSERT INTO approval_requests (id, org_id, harness_id, run_id, title, detail, status, requested_by, expires_at, created_at)
+    VALUES (?,?,?,?,?,?,'pending',?,?,?)`).run(id, orgId, harnessId, runId, String(title).trim(), det, userId, expiresAt, now());
+  return _approval(db.prepare("SELECT * FROM approval_requests WHERE id = ?").get(id));
+}
+
+export function listApprovalRequests(orgId, userId, { status = null, limit = 50 } = {}) {
+  if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const rows = status
+    ? db.prepare("SELECT * FROM approval_requests WHERE org_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?").all(orgId, status, lim)
+    : db.prepare("SELECT * FROM approval_requests WHERE org_id = ? ORDER BY created_at DESC LIMIT ?").all(orgId, lim);
+  return rows.map(_approval);
+}
+
+export function getApprovalRequest(userId, id) {
+  const r = db.prepare("SELECT * FROM approval_requests WHERE id = ?").get(id);
+  if (!r) throw new Error("Approval request not found.");
+  if (!orgRoleFor(r.org_id, userId)) throw new Error("Not a member of this organization.");
+  // lazily expire a stale pending request on read
+  if (r.status === "pending" && r.expires_at && now() > r.expires_at) {
+    db.prepare("UPDATE approval_requests SET status='expired', decided_at=? WHERE id=?").run(now(), id);
+    r.status = "expired"; r.decided_at = now();
+  }
+  return _approval(r);
+}
+
+export function decideApprovalRequest(userId, id, { decision, note = null } = {}) {
+  const r = db.prepare("SELECT * FROM approval_requests WHERE id = ?").get(id);
+  if (!r) throw new Error("Approval request not found.");
+  if (!orgRoleFor(r.org_id, userId)) throw new Error("Not a member of this organization.");
+  if (!["approve", "reject"].includes(decision)) throw new Error("decision must be 'approve' or 'reject'.");
+  if (r.status !== "pending") throw new Error(`This request is already ${r.status}.`);
+  if (r.expires_at && now() > r.expires_at) {
+    db.prepare("UPDATE approval_requests SET status='expired', decided_at=? WHERE id=?").run(now(), id);
+    throw new Error("This request has expired.");
+  }
+  const status = decision === "approve" ? "approved" : "rejected";
+  db.prepare("UPDATE approval_requests SET status=?, decided_by=?, decision_note=?, decided_at=? WHERE id=?")
+    .run(status, userId, note, now(), id);
+  logAudit(r.org_id, userId, "approval.decide", { targetType: "approval", targetId: id, detail: { decision } });
+  return _approval(db.prepare("SELECT * FROM approval_requests WHERE id = ?").get(id));
+}
+
+/* ── eval at scale: named datasets + stored, scored runs ──
+   A dataset is a named set of cases ({input, expected, scorer}); a run scores a
+   set of (input, output, expected, scorer) against the server scorer and stores
+   per-case results + aggregate. Owner/admin edit datasets; any member reads and
+   records runs (running an eval is not destructive). */
+function _dataset(r, withCases = true) {
+  let cases = []; try { cases = r.cases ? JSON.parse(r.cases) : []; } catch { /* ignore */ }
+  const out = { id: r.id, orgId: r.org_id, harnessId: r.harness_id, name: r.name,
+    caseCount: cases.length, createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at };
+  if (withCases) out.cases = cases;
+  return out;
+}
+
+export function createEvalDataset(orgId, userId, { name, harnessId = null, cases = [] } = {}) {
+  const role = orgRoleFor(orgId, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage eval datasets.");
+  if (!name || !String(name).trim()) throw new Error("A dataset needs a name.");
+  if (!Array.isArray(cases)) throw new Error("cases must be an array.");
+  const id = uid("eds"); const t = now();
+  db.prepare("INSERT INTO eval_datasets (id, org_id, harness_id, name, cases, created_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)")
+    .run(id, orgId, harnessId, String(name).trim(), JSON.stringify(cases), userId, t, t);
+  return _dataset(db.prepare("SELECT * FROM eval_datasets WHERE id = ?").get(id));
+}
+
+export function listEvalDatasets(orgId, userId) {
+  if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  return db.prepare("SELECT * FROM eval_datasets WHERE org_id = ? ORDER BY created_at DESC").all(orgId).map((r) => _dataset(r, false));
+}
+
+export function getEvalDataset(userId, id) {
+  const r = db.prepare("SELECT * FROM eval_datasets WHERE id = ?").get(id);
+  if (!r) throw new Error("Dataset not found.");
+  if (!orgRoleFor(r.org_id, userId)) throw new Error("Not a member of this organization.");
+  return _dataset(r);
+}
+
+export function updateEvalDataset(userId, id, patch = {}) {
+  const r = db.prepare("SELECT * FROM eval_datasets WHERE id = ?").get(id);
+  if (!r) throw new Error("Dataset not found.");
+  const role = orgRoleFor(r.org_id, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage eval datasets.");
+  if (patch.cases !== undefined && !Array.isArray(patch.cases)) throw new Error("cases must be an array.");
+  db.prepare("UPDATE eval_datasets SET name=?, cases=?, updated_at=? WHERE id=?").run(
+    patch.name !== undefined ? String(patch.name).trim() : r.name,
+    patch.cases !== undefined ? JSON.stringify(patch.cases) : r.cases, now(), id);
+  return _dataset(db.prepare("SELECT * FROM eval_datasets WHERE id = ?").get(id));
+}
+
+export function deleteEvalDataset(userId, id) {
+  const r = db.prepare("SELECT * FROM eval_datasets WHERE id = ?").get(id);
+  if (!r) throw new Error("Dataset not found.");
+  const role = orgRoleFor(r.org_id, userId);
+  if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage eval datasets.");
+  db.prepare("DELETE FROM eval_datasets WHERE id = ?").run(id);
+  return { deleted: true };
+}
+
+function _evalRun(r, withResults = true) {
+  let results = []; try { results = r.results ? JSON.parse(r.results) : []; } catch { /* ignore */ }
+  const out = { id: r.id, orgId: r.org_id, datasetId: r.dataset_id, harnessId: r.harness_id, label: r.label,
+    total: r.total, passed: r.passed, passRate: r.total ? r.passed / r.total : 0, scoreAvg: r.score_avg,
+    createdBy: r.created_by, createdAt: r.created_at };
+  if (withResults) out.results = results;
+  return out;
+}
+
+// Record a run: score the supplied cases server-side and store results + aggregate.
+export function recordEvalRun(orgId, userId, { datasetId = null, harnessId = null, label = null, cases = [] } = {}) {
+  if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  const { results, total, passed, scoreAvg } = scoreDataset(cases);
+  const id = uid("ern");
+  db.prepare("INSERT INTO eval_runs (id, org_id, dataset_id, harness_id, label, total, passed, score_avg, results, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+    .run(id, orgId, datasetId, harnessId, label, total, passed, scoreAvg, JSON.stringify(results), userId, now());
+  return _evalRun(db.prepare("SELECT * FROM eval_runs WHERE id = ?").get(id));
+}
+
+export function listEvalRuns(orgId, userId, { datasetId = null, limit = 50 } = {}) {
+  if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const rows = datasetId
+    ? db.prepare("SELECT * FROM eval_runs WHERE org_id = ? AND dataset_id = ? ORDER BY created_at DESC LIMIT ?").all(orgId, datasetId, lim)
+    : db.prepare("SELECT * FROM eval_runs WHERE org_id = ? ORDER BY created_at DESC LIMIT ?").all(orgId, lim);
+  return rows.map((r) => _evalRun(r, false));
+}
+
+export function getEvalRun(userId, id) {
+  const r = db.prepare("SELECT * FROM eval_runs WHERE id = ?").get(id);
+  if (!r) throw new Error("Eval run not found.");
+  if (!orgRoleFor(r.org_id, userId)) throw new Error("Not a member of this organization.");
+  return _evalRun(r);
+}
+
+// Compare two runs by case input: regressions (passed→failed), fixes (failed→passed).
+export function compareEvalRuns(userId, aId, bId) {
+  const a = getEvalRun(userId, aId), b = getEvalRun(userId, bId);
+  const byInput = new Map(a.results.map((r) => [r.input, r]));
+  const regressions = [], fixes = [], changed = [];
+  for (const rb of b.results) {
+    const ra = byInput.get(rb.input);
+    if (!ra) continue;
+    if (ra.passed && !rb.passed) regressions.push({ input: rb.input, before: ra, after: rb });
+    else if (!ra.passed && rb.passed) fixes.push({ input: rb.input, before: ra, after: rb });
+    if (ra.passed !== rb.passed) changed.push(rb.input);
+  }
+  return { a: { id: a.id, passRate: a.passRate, passed: a.passed, total: a.total },
+           b: { id: b.id, passRate: b.passRate, passed: b.passed, total: b.total },
+           passRateDelta: b.passRate - a.passRate, regressions, fixes, changedCount: changed.length };
 }
 
 /* ── budgets & quotas (per org; spend caps + request quotas) ──

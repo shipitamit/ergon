@@ -17,6 +17,7 @@ import {
 import { forwardRun } from "./gateway.mjs";
 import { fireTrigger } from "./triggers.mjs";
 import { evaluateAlerts } from "./alerts.mjs";
+import { deliverTransitions, testChannel } from "./alert-delivery.mjs";
 import * as hosting from "./hosting.mjs";
 import { makeMachinesDriver } from "./hosting-driver.mjs";
 
@@ -134,7 +135,9 @@ export async function handleApiRoutes(req, res) {
   // administration or the auth surface. A runner may also *resolve* a connection
   // (it needs the credential to make the call), so that one path is permitted.
   const isConnResolve = /^\/api\/orgs\/[^/]+\/connections\/[^/]+\/resolve$/.test(p);
-  if (viaKey && !(p.startsWith("/api/harnesses") || p.startsWith("/api/kv") || p.startsWith("/api/runs") || p.startsWith("/api/gw") || isConnResolve)) {
+  // a deployed runner (API key) files + polls approval requests; it may not decide them
+  const isApprovalPath = /^\/api\/orgs\/[^/]+\/approvals(\/[^/]+)?$/.test(p);
+  if (viaKey && !(p.startsWith("/api/harnesses") || p.startsWith("/api/kv") || p.startsWith("/api/runs") || p.startsWith("/api/gw") || isConnResolve || isApprovalPath)) {
     json(res, 403, { error: "API keys may only access the harness, kv, run, and gateway endpoints." });
     return true;
   }
@@ -438,7 +441,9 @@ export async function handleApiRoutes(req, res) {
         alertAggregate: db.alertAggregate, recordAlertEvent: db.recordAlertEvent,
         setAlertRuleState: db.setAlertRuleState,
       }));
-      return json(res, 200, { transitions }), true;
+      let delivered = 0;
+      try { delivered = await deliverTransitions(db, transitions); } catch { /* best-effort */ }
+      return json(res, 200, { transitions, delivered }), true;
     }
     const alertsMatch = p.match(/^\/api\/orgs\/([^/]+)\/alerts$/);
     if (alertsMatch) {
@@ -458,6 +463,106 @@ export async function handleApiRoutes(req, res) {
       const rid = decodeURIComponent(alertItemMatch[2]);
       if (req.method === "PATCH") return json(res, 200, { rule: await db.updateAlertRule(me.id, rid, await readBody(req)) }), true;
       if (req.method === "DELETE") return json(res, 200, await db.deleteAlertRule(me.id, rid)), true;
+    }
+    // ── alert delivery channels (webhook / slack) ──
+    const chanTestMatch = p.match(/^\/api\/orgs\/([^/]+)\/alert-channels\/([^/]+)\/test$/);
+    if (chanTestMatch && req.method === "POST") {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Alerts are a signed-in surface." }); return true; }
+      const oid = decodeURIComponent(chanTestMatch[1]);
+      const ch = (await db.listAlertChannels(oid, me.id)).find((c) => c.id === decodeURIComponent(chanTestMatch[2]));
+      if (!ch) { json(res, 404, { error: "Channel not found." }); return true; }
+      try { await testChannel(ch); return json(res, 200, { ok: true }), true; }
+      catch (e) { return json(res, 200, { ok: false, error: String(e.message || e) }), true; }
+    }
+    const chanItemMatch = p.match(/^\/api\/orgs\/([^/]+)\/alert-channels\/([^/]+)$/);
+    if (chanItemMatch) {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Alerts are a signed-in surface." }); return true; }
+      const cid = decodeURIComponent(chanItemMatch[2]);
+      if (req.method === "PATCH") return json(res, 200, { channel: await db.updateAlertChannel(me.id, cid, await readBody(req)) }), true;
+      if (req.method === "DELETE") return json(res, 200, await db.deleteAlertChannel(me.id, cid)), true;
+    }
+    const chansMatch = p.match(/^\/api\/orgs\/([^/]+)\/alert-channels$/);
+    if (chansMatch) {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Alerts are a signed-in surface." }); return true; }
+      const oid = decodeURIComponent(chansMatch[1]);
+      if (req.method === "GET") return json(res, 200, { channels: await db.listAlertChannels(oid, me.id) }), true;
+      if (req.method === "POST") {
+        const { type, target, config } = await readBody(req);
+        return json(res, 200, { channel: await db.createAlertChannel(oid, me.id, { type, target, config }) }), true;
+      }
+    }
+
+    // ── human-in-the-loop approvals (members + runner keys file/read; only a
+    //    signed-in human decides) ──
+    const apprDecideMatch = p.match(/^\/api\/orgs\/([^/]+)\/approvals\/([^/]+)\/decide$/);
+    if (apprDecideMatch && req.method === "POST") {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "An approval must be decided by a signed-in person." }); return true; }
+      const { decision, note } = await readBody(req);
+      return json(res, 200, { request: await db.decideApprovalRequest(me.id, decodeURIComponent(apprDecideMatch[2]), { decision, note }) }), true;
+    }
+    const apprItemMatch = p.match(/^\/api\/orgs\/([^/]+)\/approvals\/([^/]+)$/);
+    if (apprItemMatch && req.method === "GET") {
+      if (!requireAuth()) return true;
+      return json(res, 200, { request: await db.getApprovalRequest(me.id, decodeURIComponent(apprItemMatch[2])) }), true;
+    }
+    const apprMatch = p.match(/^\/api\/orgs\/([^/]+)\/approvals$/);
+    if (apprMatch) {
+      if (!requireAuth()) return true;
+      const oid = decodeURIComponent(apprMatch[1]);
+      if (req.method === "GET") return json(res, 200, { requests: await db.listApprovalRequests(oid, me.id, { status: url.searchParams.get("status") || null }) }), true;
+      if (req.method === "POST") {
+        const { harnessId, runId, title, detail, expiresAt } = await readBody(req);
+        return json(res, 200, { request: await db.createApprovalRequest(oid, me.id, { harnessId, runId, title, detail, expiresAt }) }), true;
+      }
+    }
+
+    // ── eval at scale: datasets + stored, scored runs (signed-in) ──
+    const evalCompareMatch = p.match(/^\/api\/orgs\/([^/]+)\/eval\/compare$/);
+    if (evalCompareMatch && req.method === "GET") {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Evals are a signed-in surface." }); return true; }
+      return json(res, 200, { comparison: await db.compareEvalRuns(me.id, url.searchParams.get("a"), url.searchParams.get("b")) }), true;
+    }
+    const evalDsItemMatch = p.match(/^\/api\/orgs\/([^/]+)\/eval\/datasets\/([^/]+)$/);
+    if (evalDsItemMatch) {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Evals are a signed-in surface." }); return true; }
+      const did = decodeURIComponent(evalDsItemMatch[2]);
+      if (req.method === "GET") return json(res, 200, { dataset: await db.getEvalDataset(me.id, did) }), true;
+      if (req.method === "PATCH") return json(res, 200, { dataset: await db.updateEvalDataset(me.id, did, await readBody(req)) }), true;
+      if (req.method === "DELETE") return json(res, 200, await db.deleteEvalDataset(me.id, did)), true;
+    }
+    const evalDsMatch = p.match(/^\/api\/orgs\/([^/]+)\/eval\/datasets$/);
+    if (evalDsMatch) {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Evals are a signed-in surface." }); return true; }
+      const oid = decodeURIComponent(evalDsMatch[1]);
+      if (req.method === "GET") return json(res, 200, { datasets: await db.listEvalDatasets(oid, me.id) }), true;
+      if (req.method === "POST") {
+        const { name, harnessId, cases } = await readBody(req);
+        return json(res, 200, { dataset: await db.createEvalDataset(oid, me.id, { name, harnessId, cases }) }), true;
+      }
+    }
+    const evalRunItemMatch = p.match(/^\/api\/orgs\/([^/]+)\/eval\/runs\/([^/]+)$/);
+    if (evalRunItemMatch && req.method === "GET") {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Evals are a signed-in surface." }); return true; }
+      return json(res, 200, { run: await db.getEvalRun(me.id, decodeURIComponent(evalRunItemMatch[2])) }), true;
+    }
+    const evalRunsMatch = p.match(/^\/api\/orgs\/([^/]+)\/eval\/runs$/);
+    if (evalRunsMatch) {
+      if (!requireAuth()) return true;
+      if (viaKey) { json(res, 403, { error: "Evals are a signed-in surface." }); return true; }
+      const oid = decodeURIComponent(evalRunsMatch[1]);
+      if (req.method === "GET") return json(res, 200, { runs: await db.listEvalRuns(oid, me.id, { datasetId: url.searchParams.get("datasetId") || null }) }), true;
+      if (req.method === "POST") {
+        const { datasetId, harnessId, label, cases } = await readBody(req);
+        return json(res, 200, { run: await db.recordEvalRun(oid, me.id, { datasetId, harnessId, label, cases }) }), true;
+      }
     }
 
     // ── managed hosting: Ergon-operated runners (signed-in; owner/admin to mutate) ──

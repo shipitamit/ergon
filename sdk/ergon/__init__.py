@@ -30,6 +30,9 @@ from .rag_adapters import (CohereEmbedder, VoyageEmbedder, make_embedder,
                            QdrantStore, ChromaStore, PineconeStore,
                            WeaviateStore, MilvusStore, make_vector_store)
 from . import loaders
+from .guardrails import (Guard, PIIGuard, ModerationGuard, SchemaGuard,
+                         GuardResult, Finding, redact_pii, find_pii, apply_guards)
+from .approvals import ApprovalClient, ApprovalTimeout
 from .router import (resolve, Router, Deployment, LiteLLMProvider, ProviderSpec,
                      register_provider, register_cost, known_providers)
 from .connections import connection, Connection, ConnectionError
@@ -44,7 +47,7 @@ from .tools import (
     web_search_tool,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 __all__ = [
     "Agent", "AgentResult", "ApprovalPolicy", "ApprovalDenied",
     "ErgonError", "ProviderError", "RateLimitError", "TransientProviderError",
@@ -71,6 +74,9 @@ __all__ = [
     "CohereEmbedder", "VoyageEmbedder", "make_embedder",
     "QdrantStore", "ChromaStore", "PineconeStore", "WeaviateStore", "MilvusStore",
     "make_vector_store", "loaders",
+    "Guard", "PIIGuard", "ModerationGuard", "SchemaGuard", "GuardResult", "Finding",
+    "redact_pii", "find_pii", "apply_guards",
+    "ApprovalClient", "ApprovalTimeout",
     "resolve", "Router", "Deployment", "LiteLLMProvider", "ProviderSpec",
     "register_provider", "register_cost", "known_providers",
     "connection", "Connection", "ConnectionError",

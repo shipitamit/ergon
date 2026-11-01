@@ -98,6 +98,12 @@ class Agent:
         mode: str = "execute",
         # 10) approval policy (defaults to interactive+heuristics):
         approval: Optional[ApprovalPolicy] = None,
+        # guardrails: safety checks on the prompt (input_guards) and the final
+        # answer (output_guards). Each is a list of ergon.guardrails.Guard. A
+        # guard may redact, flag, or block; a block refuses the input / withholds
+        # the output. Default: none (behavior unchanged).
+        input_guards: Optional[List[Any]] = None,
+        output_guards: Optional[List[Any]] = None,
         # 12) optional skills directory:
         skills_dir: Optional[str] = None,
         # 14) optional shell:
@@ -141,6 +147,8 @@ class Agent:
         self.name = name
         self.system = system
         self.mode = mode
+        self.input_guards = list(input_guards or [])
+        self.output_guards = list(output_guards or [])
         self.max_iterations = max_iterations
         self.retry = retry if retry is not None else RetryPolicy()
         self.checkpoints_enabled = checkpoints
@@ -324,6 +332,21 @@ class Agent:
             messages = []
             self.session.clear()
         messages = list(messages)   # don't mutate the loaded snapshot in place
+
+        # input guardrails: redact / flag / block the prompt before the model
+        # (and before it's persisted) sees it.
+        input_blocked = None
+        if self.input_guards:
+            from .guardrails import apply_guards
+            gres = apply_guards(prompt, self.input_guards, "input")
+            if gres.findings:
+                self.session.log_event("guardrail", stage="input", action=gres.action,
+                                        ok=gres.ok, findings=[f.type for f in gres.findings])
+            if not gres.ok:
+                input_blocked = gres.reason or "Request blocked by an input guardrail."
+            else:
+                prompt = gres.text
+
         messages.append({"role": "user", "content": prompt})
         self.session.log_event("run_start", agent=self.name, provider=self.provider.name,
                                model=self.model, prompt=prompt[:500], mode=self.mode)
@@ -334,9 +357,23 @@ class Agent:
         i = 0
 
         def _finish(stop_reason):
+            nonlocal final_text
+            # output guardrails: redact / flag / block the final answer.
+            if self.output_guards and stop_reason not in ("input_blocked",):
+                from .guardrails import apply_guards
+                gres = apply_guards(final_text, self.output_guards, "output")
+                if gres.findings:
+                    self.session.log_event("guardrail", stage="output", action=gres.action,
+                                            ok=gres.ok, findings=[f.type for f in gres.findings])
+                final_text = gres.text if gres.ok else (gres.reason or "Output withheld by a guardrail.")
             self.session.log_event("run_end", agent=self.name, stop=stop_reason, iterations=i + 1,
                                    total_tokens=usage.total_tokens, cost=usage.cost())
             return AgentResult(final_text, messages, i + 1, stop_reason, usage)
+
+        if input_blocked is not None:
+            final_text = input_blocked
+            yield StreamEvent("done", _finish("input_blocked"), self.name)
+            return
 
         for i in range(self.max_iterations):
             if tok.cancelled:

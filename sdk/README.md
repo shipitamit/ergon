@@ -702,6 +702,59 @@ shapes and the response parsing are all exercised with no network. Real embeddin
 quality and a live vector database are not exercised in this build — validate
 relevance against the real services before you rely on them.
 
+## Guardrails
+
+Drop-in safety checks on what goes into and comes out of an agent. Attach guards
+to `input_guards` (run on the prompt before the model sees it) and `output_guards`
+(run on the final answer):
+
+```python
+from ergon import Agent, PIIGuard, ModerationGuard, SchemaGuard
+
+agent = Agent("support",
+              input_guards=[PIIGuard(), ModerationGuard()],      # redact PII, block disallowed asks
+              output_guards=[SchemaGuard({"type": "object",       # require JSON that matches a shape
+                                          "required": ["answer"]}, action="flag")])
+```
+
+Three guards, all deterministic and dependency-free:
+- **`PIIGuard`** — detects emails, phone numbers, credit cards (Luhn-checked),
+  SSNs, IPs and common API-key shapes, and **redacts** them by default (or
+  `action="flag"` / `"block"`).
+- **`ModerationGuard`** — blocks or flags content by pattern; pass
+  `classifier=lambda text: [...]` to back it with a model instead of the default
+  blocklist.
+- **`SchemaGuard`** (output) — checks the answer parses as JSON and matches a
+  minimal JSON-schema shape; `flag` annotates, `block` withholds.
+
+A guard's `action` decides the effect: `redact` rewrites the text and continues,
+`flag` records findings but lets it through, `block` refuses the input or
+withholds the output (the model isn't even called when input is blocked).
+Findings are logged to the session. Use them standalone too — `redact_pii(text)`,
+`find_pii(text)`, or `apply_guards(text, guards, stage)`.
+
+## Human-in-the-loop approvals
+
+`ApprovalPolicy` gates tool calls in-process; for a decision a **person** makes
+out of band, file an approval request to the Studio server and wait — a reviewer
+approves or rejects it in the Studio **Approvals inbox**:
+
+```python
+from ergon.approvals import ApprovalClient
+
+appr = ApprovalClient.from_env()     # ERGON_API_URL / ERGON_API_KEY / ERGON_ORG_ID
+ok, req = appr.request_and_wait("Refund $500 to customer 123",
+                                detail={"amount": 500, "customer": "123"})
+if not ok:
+    raise RuntimeError(f"not approved: {req['status']}")
+```
+
+A managed runner already boots with those env vars, so `from_env()` works there
+with no setup. `request()` files a pending item, `wait()` polls until it leaves
+`pending` (raising `ApprovalTimeout` past the deadline), and `request_and_wait()`
+does both and returns `(approved, request)`. HTTP and sleep are injectable, so
+the flow is testable offline.
+
 ## MCP (Model Context Protocol)
 
 Point an agent at an [MCP](https://modelcontextprotocol.io) server and it

@@ -36,12 +36,11 @@ export async function evaluateAlerts(db, { now = Date.now() } = {}) {
       if (newState !== r.lastState) {
         const evState = firing ? "firing" : "resolved";
         const rounded = Math.round(value * 1000) / 1000;
-        await db.recordAlertEvent(r.id, r.orgId, {
-          state: evState, value, threshold: r.threshold,
-          message: `${r.name}: ${r.metric} = ${rounded} ${r.comparator} ${r.threshold}`,
-        });
+        const message = `${r.name}: ${r.metric} = ${rounded} ${r.comparator} ${r.threshold}`;
+        await db.recordAlertEvent(r.id, r.orgId, { state: evState, value, threshold: r.threshold, message });
         await db.setAlertRuleState(r.id, { state: newState, evaluatedAt: now, triggeredAt: firing ? now : null });
-        transitions.push({ ruleId: r.id, orgId: r.orgId, state: evState, value });
+        transitions.push({ ruleId: r.id, orgId: r.orgId, state: evState, value,
+          name: r.name, metric: r.metric, threshold: r.threshold, message, at: now });
       } else {
         await db.setAlertRuleState(r.id, { state: newState, evaluatedAt: now });
       }
@@ -50,9 +49,16 @@ export async function evaluateAlerts(db, { now = Date.now() } = {}) {
   return transitions;
 }
 
-// Start periodic evaluation. Returns a stop() function. Mirrors startScheduler.
+// Start periodic evaluation + delivery. Returns a stop() function.
 export function startAlertEvaluator(db, { intervalMs = 60_000 } = {}) {
-  const h = setInterval(() => { evaluateAlerts(db).catch(() => {}); }, intervalMs);
+  const tick = async () => {
+    const transitions = await evaluateAlerts(db);
+    if (transitions.length) {
+      const { deliverTransitions } = await import("./alert-delivery.mjs");
+      await deliverTransitions(db, transitions);
+    }
+  };
+  const h = setInterval(() => { tick().catch(() => {}); }, intervalMs);
   h.unref?.();
   return () => clearInterval(h);
 }

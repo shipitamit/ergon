@@ -1213,6 +1213,8 @@ function AnalyticsModal({ currentOrgId, onClose }) {
   // alerts
   const [rules, setRules] = React.useState([]);
   const [events, setEvents] = React.useState([]);
+  const [channels, setChannels] = React.useState([]);
+  const [chForm, setChForm] = React.useState({ type: "slack", target: "" });
   const [form, setForm] = React.useState({ name: "", metric: "error_rate", comparator: ">", threshold: "0.2", windowH: "24" });
 
   const RANGES = { "24h": { ms: 86400000, bucket: "hour" }, "7d": { ms: 7 * 86400000, bucket: "day" }, "30d": { ms: 30 * 86400000, bucket: "day" } };
@@ -1230,9 +1232,16 @@ function AnalyticsModal({ currentOrgId, onClose }) {
   };
   const loadAlerts = async (oid = orgId) => {
     if (!oid) return;
-    try { setRules(await cloud.alerts(oid)); setEvents(await cloud.alertEvents(oid, { limit: 20 })); }
+    try { setRules(await cloud.alerts(oid)); setEvents(await cloud.alertEvents(oid, { limit: 20 })); setChannels(await cloud.alertChannels(oid)); }
     catch (e) { setMsg(e.message); }
   };
+  const addChannel = async () => {
+    if (!chForm.target.trim()) { setMsg("A channel needs an https target URL."); return; }
+    try { await cloud.createAlertChannel(orgId, { type: chForm.type, target: chForm.target.trim() }); setChForm({ ...chForm, target: "" }); await loadAlerts(); setMsg(null); }
+    catch (e) { setMsg(e.message); }
+  };
+  const delChannel = async (id) => { try { await cloud.deleteAlertChannel(orgId, id); await loadAlerts(); } catch (e) { setMsg(e.message); } };
+  const testCh = async (id) => { try { const r = await cloud.testAlertChannel(orgId, id); setMsg(r && r.ok === false ? `Test failed: ${r.error}` : "Test sent ✓"); } catch (e) { setMsg(e.message); } };
   React.useEffect(() => { if (orgId) { loadMetrics(); loadAlerts(); setHits([]); } }, [orgId]);  // eslint-disable-line
   React.useEffect(() => { loadMetrics(); }, [rangeKey]);  // eslint-disable-line
 
@@ -1381,9 +1390,226 @@ function AnalyticsModal({ currentOrgId, onClose }) {
                 ))}
               </div>
             )}
+
+            <div style={{ marginTop: 16, paddingTop: 12, borderTop: `1px solid ${C.borderSoft}` }}>
+              <div style={{ fontSize: 11, fontFamily: MONO, letterSpacing: 1, textTransform: "uppercase", color: C.faint, marginBottom: 8 }}>Delivery channels</div>
+              <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
+                <select style={{ ...inputStyle, width: 110, marginBottom: 0 }} value={chForm.type} onChange={(e) => setChForm({ ...chForm, type: e.target.value })}>
+                  <option value="slack">slack</option><option value="webhook">webhook</option>
+                </select>
+                <input style={{ ...inputStyle, flex: 1, minWidth: 180, marginBottom: 0 }} placeholder="https webhook URL" value={chForm.target} onChange={(e) => setChForm({ ...chForm, target: e.target.value })} />
+                <button onClick={addChannel} style={{ background: C.link, color: "#fff", border: "none", borderRadius: 6, padding: "8px 12px", fontSize: 12, cursor: "pointer" }}>Add channel</button>
+              </div>
+              {channels.length === 0 && <div style={{ fontSize: 11.5, color: C.faint }}>No channels — alerts are recorded but not sent anywhere. Add a Slack incoming webhook or an HTTPS endpoint.</div>}
+              {channels.map((c) => (
+                <div key={c.id} style={{ display: "flex", gap: 8, alignItems: "center", padding: "5px 0", borderBottom: `1px solid ${C.borderSoft}`, fontSize: 12 }}>
+                  <span style={{ fontFamily: MONO, fontSize: 10.5, color: C.tool, width: 62, flex: "0 0 auto" }}>{c.type}</span>
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: C.mut, fontFamily: MONO, fontSize: 10.5 }}>{c.target}</span>
+                  <button onClick={() => testCh(c.id)} style={pillBtn(C.link)}>Test</button>
+                  <button onClick={() => delChannel(c.id)} style={pillBtn(C.output)}>Delete</button>
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
+        {msg && <div style={{ fontSize: 11.5, color: C.output, marginTop: 12, fontFamily: MONO }}>{msg}</div>}
+        <button onClick={onClose} style={{ marginTop: 16, width: "100%", background: C.panel2, border: `1px solid ${C.border}`, color: C.mut, borderRadius: 6, padding: "8px", fontSize: 12, cursor: "pointer" }}>Done</button>
+      </div>
+    </div>
+  );
+}
+
+/* ── eval at scale: manage datasets, view scored runs, compare for regressions ── */
+function EvalsModal({ currentOrgId, onClose }) {
+  const [orgs, setOrgs] = React.useState([]);
+  const [orgId, setOrgId] = React.useState(currentOrgId || null);
+  const [datasets, setDatasets] = React.useState([]);
+  const [sel, setSel] = React.useState(null);        // selected dataset (with cases)
+  const [casesText, setCasesText] = React.useState("[]");
+  const [newName, setNewName] = React.useState("");
+  const [runs, setRuns] = React.useState([]);
+  const [openRun, setOpenRun] = React.useState(null); // expanded run (per-case)
+  const [cmp, setCmp] = React.useState(null);
+  const [msg, setMsg] = React.useState(null);
+
+  React.useEffect(() => { (async () => {
+    try { const o = await cloud.orgs(); setOrgs(o); if (!orgId && o.length) setOrgId(o[0].id); }
+    catch (e) { setMsg(e.message); }
+  })(); }, []);  // eslint-disable-line
+  const loadDatasets = async (oid = orgId) => { if (!oid) return; try { setDatasets(await cloud.evalDatasets(oid)); } catch (e) { setMsg(e.message); } };
+  React.useEffect(() => { if (orgId) { loadDatasets(orgId); setSel(null); setRuns([]); setCmp(null); setOpenRun(null); } }, [orgId]);  // eslint-disable-line
+
+  const pickDataset = async (id) => {
+    setCmp(null); setOpenRun(null);
+    try {
+      const ds = await cloud.evalDataset(orgId, id); setSel(ds);
+      setCasesText(JSON.stringify(ds.cases || [], null, 2));
+      setRuns(await cloud.evalRuns(orgId, { datasetId: id }));
+    } catch (e) { setMsg(e.message); }
+  };
+  const createDs = async () => {
+    if (!newName.trim()) { setMsg("A dataset needs a name."); return; }
+    try { const ds = await cloud.createEvalDataset(orgId, { name: newName.trim(), cases: [] }); setNewName(""); await loadDatasets(); pickDataset(ds.id); }
+    catch (e) { setMsg(e.message); }
+  };
+  const saveCases = async () => {
+    let cases; try { cases = JSON.parse(casesText); } catch { setMsg("Cases must be valid JSON (an array)."); return; }
+    try { await cloud.updateEvalDataset(orgId, sel.id, { cases }); setMsg("Saved ✓"); await loadDatasets(); }
+    catch (e) { setMsg(e.message); }
+  };
+  const delDs = async () => { try { await cloud.deleteEvalDataset(orgId, sel.id); setSel(null); await loadDatasets(); } catch (e) { setMsg(e.message); } };
+  const compareLatest = async () => {
+    if (runs.length < 2) { setMsg("Need at least two runs to compare."); return; }
+    try { setCmp(await cloud.compareEvalRuns(orgId, runs[1].id, runs[0].id)); setMsg(null); } catch (e) { setMsg(e.message); }
+  };
+  const pct = (x) => `${Math.round((x || 0) * 100)}%`;
+  const when = (ms) => ms ? new Date(ms).toLocaleString() : "—";
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(6,8,12,.7)", zIndex: 60, display: "flex", alignItems: "center", justifyContent: "center", padding: 30 }}>
+      <div className="ergon-modal" onClick={(e) => e.stopPropagation()} style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, width: "min(860px, 97vw)", maxHeight: "90vh", overflowY: "auto", padding: 22 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, gap: 10 }}>
+          <div style={{ fontWeight: 700, fontSize: 15 }}>🧪 Evals</div>
+          <select style={{ ...inputStyle, width: 200, marginBottom: 0 }} value={orgId || ""} onChange={(e) => setOrgId(e.target.value)}>
+            {orgs.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
+          </select>
+        </div>
+
+        <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
+          <select style={{ ...inputStyle, width: 220, marginBottom: 0 }} value={sel ? sel.id : ""} onChange={(e) => e.target.value && pickDataset(e.target.value)}>
+            <option value="">— pick a dataset —</option>
+            {datasets.map((d) => <option key={d.id} value={d.id}>{d.name} ({d.caseCount})</option>)}
+          </select>
+          <span style={{ color: C.faint, fontSize: 11.5 }}>or</span>
+          <input style={{ ...inputStyle, width: 150, marginBottom: 0 }} placeholder="new dataset name" value={newName} onChange={(e) => setNewName(e.target.value)} />
+          <button onClick={createDs} style={{ background: C.tool, color: "#06121a", border: "none", borderRadius: 6, padding: "8px 12px", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>Create</button>
+        </div>
+
+        {sel && (
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+              <div style={{ fontWeight: 600, fontSize: 13, flex: 1 }}>{sel.name}</div>
+              <button onClick={saveCases} style={pillBtn(C.run)}>Save cases</button>
+              <button onClick={delDs} style={pillBtn(C.output)}>Delete</button>
+            </div>
+            <div style={{ fontSize: 10.5, fontFamily: MONO, color: C.faint, marginBottom: 4 }}>cases — array of {"{ input, expected, scorer: { type } }"}</div>
+            <textarea value={casesText} onChange={(e) => setCasesText(e.target.value)} spellCheck={false}
+              style={{ width: "100%", minHeight: 120, background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontFamily: MONO, fontSize: 11, padding: 8, boxSizing: "border-box" }} />
+
+            <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "14px 0 6px" }}>
+              <div style={{ fontSize: 11, fontFamily: MONO, letterSpacing: 1, textTransform: "uppercase", color: C.faint, flex: 1 }}>Runs ({runs.length})</div>
+              {runs.length >= 2 && <button onClick={compareLatest} style={pillBtn(C.link)}>Compare latest two</button>}
+            </div>
+            {runs.length === 0 && <div style={{ fontSize: 11.5, color: C.faint }}>No runs yet. Push results via the API / <span style={{ fontFamily: MONO }}>recordEvalRun</span> (CI or the SDK).</div>}
+            {cmp && (
+              <div style={{ padding: 10, background: C.panel2, borderRadius: 6, marginBottom: 8, fontSize: 12 }}>
+                <b>Δ pass rate {cmp.passRateDelta >= 0 ? "+" : ""}{pct(cmp.passRateDelta)}</b>
+                <span style={{ color: C.output, marginLeft: 10 }}>{cmp.regressions.length} regression(s)</span>
+                <span style={{ color: C.run, marginLeft: 10 }}>{cmp.fixes.length} fix(es)</span>
+                {cmp.regressions.slice(0, 5).map((r, i) => <div key={i} style={{ fontFamily: MONO, fontSize: 10.5, color: C.output, marginTop: 3 }}>↓ {String(r.input).slice(0, 80)}</div>)}
+              </div>
+            )}
+            {runs.map((r) => (
+              <div key={r.id} style={{ border: `1px solid ${C.borderSoft}`, borderRadius: 6, padding: "6px 10px", marginBottom: 5 }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", cursor: "pointer" }} onClick={async () => { try { setOpenRun(openRun && openRun.id === r.id ? null : await cloud.evalRun(orgId, r.id)); } catch (e) { setMsg(e.message); } }}>
+                  <span style={{ fontWeight: 700, fontSize: 13, color: r.passRate >= 0.8 ? C.run : r.passRate >= 0.5 ? C.agent : C.output, width: 48 }}>{pct(r.passRate)}</span>
+                  <span style={{ flex: 1, minWidth: 0, fontSize: 12 }}>{r.label || "run"} <span style={{ color: C.faint }}>· {r.passed}/{r.total}</span></span>
+                  <span style={{ fontFamily: MONO, fontSize: 10, color: C.faint }}>{when(r.createdAt)}</span>
+                </div>
+                {openRun && openRun.id === r.id && (
+                  <div style={{ marginTop: 6 }}>
+                    {(openRun.results || []).map((c, i) => (
+                      <div key={i} style={{ display: "flex", gap: 8, padding: "3px 0", borderTop: `1px solid ${C.borderSoft}`, fontFamily: MONO, fontSize: 10.5 }}>
+                        <span style={{ color: c.passed ? C.run : C.output, width: 40, flex: "0 0 auto" }}>{c.passed ? "pass" : "fail"}</span>
+                        <span style={{ color: C.mut, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{String(c.input).slice(0, 60)} → {String(c.output).slice(0, 60)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {msg && <div style={{ fontSize: 11.5, color: C.output, marginTop: 12, fontFamily: MONO }}>{msg}</div>}
+        <button onClick={onClose} style={{ marginTop: 16, width: "100%", background: C.panel2, border: `1px solid ${C.border}`, color: C.mut, borderRadius: 6, padding: "8px", fontSize: 12, cursor: "pointer" }}>Done</button>
+      </div>
+    </div>
+  );
+}
+
+/* ── human-in-the-loop: review & decide pending approval requests ── */
+function ApprovalsModal({ currentOrgId, onClose }) {
+  const [orgs, setOrgs] = React.useState([]);
+  const [orgId, setOrgId] = React.useState(currentOrgId || null);
+  const [requests, setRequests] = React.useState([]);
+  const [notes, setNotes] = React.useState({});     // per-request decision note
+  const [busy, setBusy] = React.useState(false);
+  const [msg, setMsg] = React.useState(null);
+
+  React.useEffect(() => { (async () => {
+    try { const o = await cloud.orgs(); setOrgs(o); if (!orgId && o.length) setOrgId(o[0].id); }
+    catch (e) { setMsg(e.message); }
+  })(); }, []);  // eslint-disable-line
+  const load = async (oid = orgId) => { if (!oid) return; try { setRequests(await cloud.approvals(oid)); setMsg(null); } catch (e) { setMsg(e.message); setRequests([]); } };
+  React.useEffect(() => { if (orgId) load(orgId); }, [orgId]);  // eslint-disable-line
+
+  const decide = async (id, decision) => {
+    setBusy(true);
+    try { await cloud.decideApproval(orgId, id, decision, (notes[id] || "").trim() || undefined); await load(); setMsg(null); }
+    catch (e) { setMsg(e.message); } finally { setBusy(false); }
+  };
+  const when = (ms) => ms ? new Date(ms).toLocaleString() : "—";
+  const statusColor = (s) => s === "approved" ? C.run : s === "rejected" ? C.output : s === "pending" ? C.agent : C.faint;
+  const pending = requests.filter((r) => r.status === "pending");
+  const decided = requests.filter((r) => r.status !== "pending");
+
+  const card = (r, actionable) => (
+    <div key={r.id} style={{ border: `1px solid ${C.borderSoft}`, borderRadius: 7, padding: "9px 11px", marginBottom: 7 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <span style={{ width: 9, height: 9, borderRadius: 9, background: statusColor(r.status), flex: "0 0 auto" }} title={r.status} />
+        <span style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.title}</span>
+        <span style={{ fontFamily: MONO, fontSize: 10, color: C.faint, flex: "0 0 auto" }}>{when(r.createdAt)}</span>
+      </div>
+      {r.detail != null && (
+        <pre style={{ margin: "6px 0 0", padding: 8, background: C.panel2, borderRadius: 6, fontFamily: MONO, fontSize: 10.5, whiteSpace: "pre-wrap", color: C.mut, maxHeight: 120, overflowY: "auto" }}>{typeof r.detail === "string" ? r.detail : JSON.stringify(r.detail, null, 2)}</pre>
+      )}
+      {actionable ? (
+        <div style={{ display: "flex", gap: 6, marginTop: 8, alignItems: "center" }}>
+          <input style={{ ...inputStyle, flex: 1, marginBottom: 0 }} placeholder="note (optional)" value={notes[r.id] || ""} onChange={(e) => setNotes({ ...notes, [r.id]: e.target.value })} />
+          <button onClick={() => decide(r.id, "approve")} disabled={busy} style={{ background: C.run, color: "#fff", border: "none", borderRadius: 6, padding: "7px 14px", fontSize: 12, cursor: "pointer" }}>Approve</button>
+          <button onClick={() => decide(r.id, "reject")} disabled={busy} style={{ background: "transparent", color: C.output, border: `1px solid ${C.output}`, borderRadius: 6, padding: "7px 14px", fontSize: 12, cursor: "pointer" }}>Reject</button>
+        </div>
+      ) : (
+        <div style={{ marginTop: 5, fontSize: 11, fontFamily: MONO, color: C.faint }}>
+          {r.status}{r.decisionNote ? ` · “${r.decisionNote}”` : ""}{r.decidedAt ? ` · ${when(r.decidedAt)}` : ""}
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(6,8,12,.7)", zIndex: 60, display: "flex", alignItems: "center", justifyContent: "center", padding: 30 }}>
+      <div className="ergon-modal" onClick={(e) => e.stopPropagation()} style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, width: "min(760px, 96vw)", maxHeight: "90vh", overflowY: "auto", padding: 22 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, gap: 10 }}>
+          <div style={{ fontWeight: 700, fontSize: 15 }}>✅ Approvals inbox</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={() => load()} style={{ background: "transparent", border: `1px solid ${C.border}`, color: C.mut, borderRadius: 6, padding: "6px 10px", fontSize: 11.5, cursor: "pointer" }}>Refresh</button>
+            <select style={{ ...inputStyle, width: 180, marginBottom: 0 }} value={orgId || ""} onChange={(e) => setOrgId(e.target.value)}>
+              {orgs.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
+            </select>
+          </div>
+        </div>
+        <div style={{ fontSize: 11, fontFamily: MONO, letterSpacing: 1, textTransform: "uppercase", color: C.faint, marginBottom: 8 }}>Pending ({pending.length})</div>
+        {pending.length === 0 && <div style={{ fontSize: 12, color: C.faint, marginBottom: 12 }}>Nothing waiting on you. A running agent that calls for human approval shows up here.</div>}
+        {pending.map((r) => card(r, true))}
+        {decided.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 11, fontFamily: MONO, letterSpacing: 1, textTransform: "uppercase", color: C.faint, marginBottom: 8 }}>Recent decisions</div>
+            {decided.slice(0, 20).map((r) => card(r, false))}
+          </div>
+        )}
         {msg && <div style={{ fontSize: 11.5, color: C.output, marginTop: 12, fontFamily: MONO }}>{msg}</div>}
         <button onClick={onClose} style={{ marginTop: 16, width: "100%", background: C.panel2, border: `1px solid ${C.border}`, color: C.mut, borderRadius: 6, padding: "8px", fontSize: 12, cursor: "pointer" }}>Done</button>
       </div>
@@ -2675,6 +2901,8 @@ export default function ErgonStudio() {
   const [runsOpen, setRunsOpen] = useState(false);
   const [analyticsOpen, setAnalyticsOpen] = useState(false);
   const [hostingOpen, setHostingOpen] = useState(false);
+  const [approvalsOpen, setApprovalsOpen] = useState(false);
+  const [evalsOpen, setEvalsOpen] = useState(false);
   const [modelOpts, setModelOpts] = useState({});    // prefix -> [model ids]
   const [modelMsg, setModelMsg] = useState({});      // prefix -> status string
   const refreshCatalog = useCallback(() => { fetchProviderCatalog().then(setProviderCatalog); }, []);
@@ -3131,6 +3359,8 @@ export default function ErgonStudio() {
               {signedIn && !IN_CLAUDE_ARTIFACT && <button style={menuItem()} onClick={() => { setMoreOpen(false); setRunsOpen(true); }}>Run history…</button>}
               {signedIn && !IN_CLAUDE_ARTIFACT && <button style={menuItem(C.link)} onClick={() => { setMoreOpen(false); setAnalyticsOpen(true); }}>📊 Analytics &amp; alerts…</button>}
               {signedIn && !IN_CLAUDE_ARTIFACT && <button style={menuItem(C.run)} onClick={() => { setMoreOpen(false); setHostingOpen(true); }}>☁️ Deploy to Ergon Cloud…</button>}
+              {signedIn && !IN_CLAUDE_ARTIFACT && <button style={menuItem(C.agent)} onClick={() => { setMoreOpen(false); setApprovalsOpen(true); }}>✅ Approvals inbox…</button>}
+              {signedIn && !IN_CLAUDE_ARTIFACT && <button style={menuItem(C.tool)} onClick={() => { setMoreOpen(false); setEvalsOpen(true); }}>🧪 Evals…</button>}
               {signedIn && !!currentId && !IN_CLAUDE_ARTIFACT && <button style={menuItem()} onClick={() => { setMoreOpen(false); openHistory(); }}>⟲ Version history…</button>}
               {signedIn && !!currentId && !IN_CLAUDE_ARTIFACT && <button style={menuItem(C.run)} onClick={() => { setMoreOpen(false); openTriggers(); }}>⚡ Triggers — webhook &amp; schedule…</button>}
               {signedIn && !IN_CLAUDE_ARTIFACT && <button style={menuItem(C.tool)} onClick={() => { setMoreOpen(false); openConnectors(); }}>🔌 Connectors &amp; connections…</button>}
@@ -4305,6 +4535,8 @@ export default function ErgonStudio() {
       {runsOpen && !IN_CLAUDE_ARTIFACT && <RunsModal currentOrgId={currentOrgId} onClose={() => setRunsOpen(false)} />}
       {analyticsOpen && !IN_CLAUDE_ARTIFACT && <AnalyticsModal currentOrgId={currentOrgId} onClose={() => setAnalyticsOpen(false)} />}
       {hostingOpen && !IN_CLAUDE_ARTIFACT && <HostingModal currentOrgId={currentOrgId} currentHarnessId={currentHarnessId} onClose={() => setHostingOpen(false)} />}
+      {approvalsOpen && !IN_CLAUDE_ARTIFACT && <ApprovalsModal currentOrgId={currentOrgId} onClose={() => setApprovalsOpen(false)} />}
+      {evalsOpen && !IN_CLAUDE_ARTIFACT && <EvalsModal currentOrgId={currentOrgId} onClose={() => setEvalsOpen(false)} />}
       {authOpen && <AuthModal onClose={() => setAuthOpen(false)} onAuthed={onAuthed} />}
 
       {connOpen && (() => {

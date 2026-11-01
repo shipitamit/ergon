@@ -181,6 +181,8 @@ def main():
         "tests.test_mcp",
         "tests.test_rag",
         "tests.test_rag_adapters",
+        "tests.test_guardrails",
+        "tests.test_approval_inbox",
         "tests.test_router",
         "tests.test_flows_control",
         "tests.test_checkpoints",
