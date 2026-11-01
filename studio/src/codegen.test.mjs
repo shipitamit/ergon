@@ -482,6 +482,52 @@ test("genPython: an HTTP tool backed by a connection resolves it at run time (no
   assert.ok(!/xoxb-|secret_|sk_live_/.test(code), "no secret material in the export");
 });
 
+// ── guardrail + approval canvas nodes ──
+test("guardrail node emits apply_guards with the configured guards + _Text shim", () => {
+  const nodes = [
+    { id: "in", type: "input", config: { message: "hi" } },
+    agent("a"),
+    { id: "g", type: "guardrail", config: { pii: true, moderation: true } },
+    { id: "out", type: "output", config: {} },
+  ];
+  const edges = [
+    { kind: "flow", from: "in", to: "a" },
+    { kind: "flow", from: "a", to: "g" },
+    { kind: "flow", from: "g", to: "out" },
+  ];
+  const code = genPython(nodes, edges);
+  assert.ok(code.includes("apply_guards(result.text, [PIIGuard(), ModerationGuard()], \"output\")"), "applies guards to the agent output");
+  assert.ok(code.includes("result = _Text(_g.text)"), "rebinds result via the shim");
+  assert.ok(/from ergon import .*apply_guards, PIIGuard, ModerationGuard, SchemaGuard/.test(code), "imports the guards");
+  assert.ok(code.includes("class _Text:"), "defines the shim");
+});
+
+test("guardrail node with a schema emits SchemaGuard", () => {
+  const nodes = [
+    { id: "in", type: "input", config: { message: "hi" } },
+    agent("a"),
+    { id: "g", type: "guardrail", config: { pii: false, schema: '{"type":"object","required":["ok"]}', schemaAction: "block" } },
+    { id: "out", type: "output", config: {} },
+  ];
+  const edges = [{ kind: "flow", from: "in", to: "a" }, { kind: "flow", from: "a", to: "g" }, { kind: "flow", from: "g", to: "out" }];
+  const code = genPython(nodes, edges);
+  assert.ok(code.includes("SchemaGuard(") && code.includes('action="block"'), "emits a SchemaGuard with the action");
+});
+
+test("approval node emits an ApprovalClient gate that halts on reject", () => {
+  const nodes = [
+    { id: "in", type: "input", config: { message: "hi" } },
+    agent("a"),
+    { id: "p", type: "approval", config: { title: "Ship it?" } },
+    { id: "out", type: "output", config: {} },
+  ];
+  const edges = [{ kind: "flow", from: "in", to: "a" }, { kind: "flow", from: "a", to: "p" }, { kind: "flow", from: "p", to: "out" }];
+  const code = genPython(nodes, edges);
+  assert.ok(/from ergon import .*ApprovalClient/.test(code), "imports ApprovalClient");
+  assert.ok(code.includes('request_and_wait("Ship it?"'), "files the approval with the title");
+  assert.ok(code.includes("raise SystemExit"), "halts the flow when not approved");
+});
+
 console.log(`\ncodegen.test.mjs: ${passed} passed, ${failed} failed`);
 for (const [n, m] of failures) console.log(`  ✗ ${n}: ${m}`);
 process.exit(failed === 0 ? 0 : 1);

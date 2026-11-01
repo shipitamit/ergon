@@ -177,6 +177,18 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_org_created ON runs (org_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_harness ON runs (harness_id);
+CREATE TABLE IF NOT EXISTS metric_rollups (
+  org_id        TEXT NOT NULL,
+  day           INTEGER NOT NULL,
+  runs          INTEGER NOT NULL DEFAULT 0,
+  errors        INTEGER NOT NULL DEFAULT 0,
+  tokens_in     INTEGER NOT NULL DEFAULT 0,
+  tokens_out    INTEGER NOT NULL DEFAULT 0,
+  cost          REAL NOT NULL DEFAULT 0,
+  latency_sum   INTEGER NOT NULL DEFAULT 0,
+  latency_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (org_id, day)
+);
 CREATE TABLE IF NOT EXISTS alert_rules (
   id           TEXT PRIMARY KEY,
   org_id       TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
@@ -190,6 +202,9 @@ CREATE TABLE IF NOT EXISTS alert_rules (
   last_state   TEXT NOT NULL DEFAULT 'ok',
   last_evaluated_at INTEGER,
   last_triggered_at INTEGER,
+  channel_ids  TEXT,
+  cooldown_ms  INTEGER,
+  last_notified_at INTEGER,
   created_by   TEXT,
   created_at   INTEGER NOT NULL
 );
@@ -393,6 +408,13 @@ try {
   const mr = db.prepare("PRAGMA table_info(managed_runners)").all().map((c) => c.name);
   if (mr.length && !mr.includes("api_key_id")) db.exec("ALTER TABLE managed_runners ADD COLUMN api_key_id TEXT");
 } catch { /* fresh DB already has it */ }
+// backward-compat: alert routing + anti-flap columns
+try {
+  const ar = db.prepare("PRAGMA table_info(alert_rules)").all().map((c) => c.name);
+  if (ar.length && !ar.includes("channel_ids")) db.exec("ALTER TABLE alert_rules ADD COLUMN channel_ids TEXT");
+  if (ar.length && !ar.includes("cooldown_ms")) db.exec("ALTER TABLE alert_rules ADD COLUMN cooldown_ms INTEGER");
+  if (ar.length && !ar.includes("last_notified_at")) db.exec("ALTER TABLE alert_rules ADD COLUMN last_notified_at INTEGER");
+} catch { /* fresh DB already has them */ }
 
 const uid = (p) => `${p}_${crypto.randomBytes(9).toString("base64url")}`;
 const now = () => Date.now();
@@ -1008,6 +1030,7 @@ export function recordRun(userId, rec = {}) {
   if (!gate.allowed) { const e = new Error(`Organization budget exceeded: ${gate.reason}`); e.code = "budget"; throw e; }
   const u = rec.usage || {};
   const id = uid("run");
+  const createdAt = now();
   db.prepare(`INSERT INTO runs (id, org_id, harness_id, harness_name, input, output, status,
       started_at, finished_at, latency_ms, tokens_in, tokens_out, cost, steps, created_by, created_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
@@ -1015,9 +1038,38 @@ export function recordRun(userId, rec = {}) {
     rec.input || "", rec.output || "", rec.status || "ok",
     rec.startedAt || null, rec.finishedAt || null, rec.latencyMs || null,
     u.input_tokens || 0, u.output_tokens || 0, u.cost || 0,
-    rec.steps ? JSON.stringify(rec.steps) : null, userId, now());
+    rec.steps ? JSON.stringify(rec.steps) : null, userId, createdAt);
+  _rollupRun(org, createdAt, rec, u);
   _pruneRuns(org);
   return { id, orgId: org };
+}
+
+// Accumulate a run into its day's durable rollup. Rollups are incremented at
+// record time, so they survive run retention pruning — the dashboard's
+// long-horizon trend stays correct even after old runs are deleted.
+function _rollupRun(org, createdAt, rec, u) {
+  const day = Math.floor(createdAt / 86400_000) * 86400_000;
+  const err = (rec.status || "ok") !== "ok" ? 1 : 0;
+  const ti = u.input_tokens || 0, to = u.output_tokens || 0, cost = u.cost || 0;
+  const hasLat = rec.latencyMs != null;
+  const latSum = hasLat ? Number(rec.latencyMs) : 0, latCnt = hasLat ? 1 : 0;
+  db.prepare(`INSERT INTO metric_rollups (org_id, day, runs, errors, tokens_in, tokens_out, cost, latency_sum, latency_count)
+      VALUES (?,?,1,?,?,?,?,?,?)
+      ON CONFLICT(org_id, day) DO UPDATE SET runs=runs+1, errors=errors+?, tokens_in=tokens_in+?,
+        tokens_out=tokens_out+?, cost=cost+?, latency_sum=latency_sum+?, latency_count=latency_count+?`)
+    .run(org, day, err, ti, to, cost, latSum, latCnt, err, ti, to, cost, latSum, latCnt);
+}
+
+// Durable daily series from rollups (survives run pruning). RBAC: member read.
+export function metricsRollupSeries(orgId, userId, { from = null, to = null } = {}) {
+  if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
+  const toMs = Number(to) || now();
+  const fromMs = Number(from) || (toMs - 30 * 86400_000);
+  return db.prepare(`SELECT * FROM metric_rollups WHERE org_id = ? AND day >= ? AND day <= ? ORDER BY day`)
+    .all(orgId, Math.floor(fromMs / 86400_000) * 86400_000, toMs)
+    .map((r) => ({ t: r.day, runs: r.runs, errors: r.errors, cost: r.cost,
+      tokensIn: r.tokens_in, tokensOut: r.tokens_out,
+      avgLatency: r.latency_count ? Math.round(r.latency_sum / r.latency_count) : null }));
 }
 
 function _pruneRuns(org) {
@@ -1163,16 +1215,18 @@ export function metricsSummary(userId, { orgId, from = null, to = null, bucket =
 const ALERT_METRICS = ["error_rate", "spend", "latency_p95", "run_count"];
 
 function _alertRule(r) {
+  let channelIds = null; try { channelIds = r.channel_ids ? JSON.parse(r.channel_ids) : null; } catch { /* ignore */ }
   return {
     id: r.id, orgId: r.org_id, name: r.name, metric: r.metric, comparator: r.comparator,
     threshold: r.threshold, windowMs: r.window_ms, harnessId: r.harness_id,
     enabled: !!r.enabled, lastState: r.last_state,
     lastEvaluatedAt: r.last_evaluated_at, lastTriggeredAt: r.last_triggered_at,
+    channelIds, cooldownMs: r.cooldown_ms, lastNotifiedAt: r.last_notified_at,
     createdBy: r.created_by, createdAt: r.created_at,
   };
 }
 
-export function createAlertRule(orgId, userId, { name, metric, comparator, threshold, windowMs, harnessId = null } = {}) {
+export function createAlertRule(orgId, userId, { name, metric, comparator, threshold, windowMs, harnessId = null, channelIds = null, cooldownMs = null } = {}) {
   const role = orgRoleFor(orgId, userId);
   if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage alerts.");
   if (!name) throw new Error("An alert needs a name.");
@@ -1182,10 +1236,11 @@ export function createAlertRule(orgId, userId, { name, metric, comparator, thres
   if (!windowMs || Number(windowMs) <= 0) throw new Error("windowMs must be a positive number.");
   const id = uid("alr");
   db.prepare(`INSERT INTO alert_rules (id, org_id, name, metric, comparator, threshold, window_ms,
-      harness_id, enabled, last_state, created_by, created_at)
-    VALUES (?,?,?,?,?,?,?,?,1,'ok',?,?)`).run(
+      harness_id, enabled, last_state, channel_ids, cooldown_ms, created_by, created_at)
+    VALUES (?,?,?,?,?,?,?,?,1,'ok',?,?,?,?)`).run(
     id, orgId, name, metric, comparator, Number(threshold), Number(windowMs),
-    harnessId || null, userId, now());
+    harnessId || null, channelIds ? JSON.stringify(channelIds) : null,
+    cooldownMs != null ? Number(cooldownMs) : null, userId, now());
   return _alertRule(db.prepare("SELECT * FROM alert_rules WHERE id = ?").get(id));
 }
 
@@ -1206,10 +1261,12 @@ export function updateAlertRule(userId, ruleId, patch = {}) {
     window_ms: patch.windowMs != null ? Number(patch.windowMs) : r.window_ms,
     harness_id: patch.harnessId !== undefined ? (patch.harnessId || null) : r.harness_id,
     enabled: patch.enabled != null ? (patch.enabled ? 1 : 0) : r.enabled,
+    channel_ids: patch.channelIds !== undefined ? (patch.channelIds ? JSON.stringify(patch.channelIds) : null) : r.channel_ids,
+    cooldown_ms: patch.cooldownMs !== undefined ? (patch.cooldownMs != null ? Number(patch.cooldownMs) : null) : r.cooldown_ms,
   };
   if (next.comparator !== ">" && next.comparator !== "<") throw new Error("comparator must be '>' or '<'.");
-  db.prepare(`UPDATE alert_rules SET name=?, comparator=?, threshold=?, window_ms=?, harness_id=?, enabled=?
-    WHERE id=?`).run(next.name, next.comparator, next.threshold, next.window_ms, next.harness_id, next.enabled, ruleId);
+  db.prepare(`UPDATE alert_rules SET name=?, comparator=?, threshold=?, window_ms=?, harness_id=?, enabled=?, channel_ids=?, cooldown_ms=?
+    WHERE id=?`).run(next.name, next.comparator, next.threshold, next.window_ms, next.harness_id, next.enabled, next.channel_ids, next.cooldown_ms, ruleId);
   return _alertRule(db.prepare("SELECT * FROM alert_rules WHERE id = ?").get(ruleId));
 }
 
@@ -1319,6 +1376,11 @@ export function deleteAlertChannel(userId, channelId) {
   if (role !== "owner" && role !== "admin") throw new Error("Only an owner or admin can manage alert channels.");
   db.prepare("DELETE FROM alert_channels WHERE id = ?").run(channelId);
   return { deleted: true };
+}
+
+// internal: stamp the last time a rule actually notified (anti-flap cooldown)
+export function markAlertNotified(ruleId, at = now()) {
+  db.prepare("UPDATE alert_rules SET last_notified_at=? WHERE id=?").run(at, ruleId);
 }
 
 // internal: enabled channels for an org (server-side delivery; no RBAC)
@@ -1640,6 +1702,11 @@ export function getManagedRunner(userId, runnerId) {
 export function listManagedRunners(orgId, userId) {
   if (!orgRoleFor(orgId, userId)) throw new Error("Not a member of this organization.");
   return db.prepare("SELECT * FROM managed_runners WHERE org_id = ? ORDER BY created_at DESC").all(orgId).map(_managedRunner);
+}
+
+// internal: runners worth a liveness check (no RBAC — the reconciler is server-side)
+export function managedRunnersToReconcile() {
+  return db.prepare("SELECT * FROM managed_runners WHERE status IN ('ready','provisioning')").all().map(_managedRunner);
 }
 
 // internal: the lifecycle service updates runner state (RBAC already enforced on entry)

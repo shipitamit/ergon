@@ -448,7 +448,7 @@ export function genPython(nodes, edges, budget = { maxTokens: "", maxCost: "" })
   L.push(`task = ${py(inputNode?.config.message || "Your task here")}`);
   let cur = inputNode, step = 0, emitted = false;
   const seen = new Set();
-  let usesFlows = false;
+  let usesFlows = false, usesGuards = false, usesApproval = false;
   while (cur) {
     const e = edges.find((x) => x.kind === "flow" && x.from === cur.id);
     const nxt = e && nodes.find((n) => n.id === e.to);
@@ -511,6 +511,24 @@ export function genPython(nodes, edges, budget = { maxTokens: "", maxCost: "" })
         L.push(`result = parallel(${src}, [${wl}])`);
       }
       step++; emitted = true;
+    } else if (nxt.type === "guardrail") {
+      usesGuards = true;
+      const c = nxt.config || {};
+      const gl = [];
+      if (c.pii !== false) gl.push("PIIGuard()");
+      if (c.moderation) gl.push("ModerationGuard()");
+      if (c.schema) { try { gl.push(`SchemaGuard(${pyDict(JSON.parse(c.schema))}, action=${py(c.schemaAction || "flag")})`); } catch { /* skip bad schema */ } }
+      if (!gl.length) gl.push("PIIGuard()");
+      L.push(`_g = apply_guards(${src}, [${gl.join(", ")}], "output")`);
+      L.push(`result = _Text(_g.text)`);
+      step++; emitted = true;
+    } else if (nxt.type === "approval") {
+      usesApproval = true;
+      const title = (nxt.config && nxt.config.title) || "Approve to continue";
+      L.push(`_ok, _req = ApprovalClient.from_env().request_and_wait(${py(title)}, detail=${src})`);
+      L.push(`if not _ok: raise SystemExit("stopped by approval: " + str(_req.get("status")))`);
+      L.push(`result = _Text(${src})`);
+      step++; emitted = true;
     } else if (nxt.type === "output") {
       L.push("print(result.text)");
       L.push("print(result.usage)   # tokens + estimated cost");
@@ -518,6 +536,9 @@ export function genPython(nodes, edges, budget = { maxTokens: "", maxCost: "" })
     }
     cur = nxt;
   }
+  if (usesGuards) L[importLineIdx] = L[importLineIdx].replace("from ergon import ", "from ergon import apply_guards, PIIGuard, ModerationGuard, SchemaGuard, ");
+  if (usesApproval) L[importLineIdx] = L[importLineIdx].replace("from ergon import ", "from ergon import ApprovalClient, ");
+  if (usesGuards || usesApproval) L.splice(importLineIdx + 1, 0, "class _Text:  # carries .text between guardrail/approval steps\n    def __init__(self, text): self.text = text");
   if (usesFlows) L[importLineIdx] = "from ergon import Agent, ApprovalPolicy, tool, web_search_tool, chain, route, parallel, branch";
   if (usesBrowser) L[importLineIdx] = L[importLineIdx].replace("from ergon import ", "from ergon import BrowserSession, browser_tools, ");
   if (usesRag) L[importLineIdx] = L[importLineIdx].replace("from ergon import ", "from ergon import KnowledgeBase, retrieve_tool, OpenAIEmbedder, InMemoryStore, PgVectorStore, ");

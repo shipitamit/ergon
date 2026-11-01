@@ -208,6 +208,7 @@ export const cloud = {
   async evalRun(orgId, id) { return (await getJSON(`/api/orgs/${encodeURIComponent(orgId)}/eval/runs/${encodeURIComponent(id)}`)).run; },
   async recordEvalRun(orgId, body) { return (await sendJSON("POST", `/api/orgs/${encodeURIComponent(orgId)}/eval/runs`, body)).run; },
   async compareEvalRuns(orgId, a, b) { return (await getJSON(`/api/orgs/${encodeURIComponent(orgId)}/eval/compare?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`)).comparison; },
+  async runEvalDataset(orgId, id, label) { return (await sendJSON("POST", `/api/orgs/${encodeURIComponent(orgId)}/eval/datasets/${encodeURIComponent(id)}/run`, { label })).run; },
   // budgets & quotas
   async budgets(orgId) { return (await getJSON(`/api/orgs/${encodeURIComponent(orgId)}/budgets`)).budgets; },
   async budgetStatus(orgId) { return (await getJSON(`/api/orgs/${encodeURIComponent(orgId)}/budgets/status`)).status; },

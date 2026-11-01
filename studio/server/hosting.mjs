@@ -150,3 +150,54 @@ export async function logs(db, userId, runnerId, { driver, limit = 100 } = {}) {
   if (!runner.machineId) return [];
   return driver.logs(runner.machineId, { limit });
 }
+
+/* Liveness reconcile: beyond the one-time boot gate, periodically check each
+   live/provisioning runner's real machine state. A ready runner whose machine
+   has stopped/errored is marked error and its deployment parked (optionally
+   auto-restarted); a provisioning runner that turned ready is promoted (its
+   deployment registered). Runs server-side across orgs. Returns a summary. */
+export async function reconcileRunners(db, { driver, autoRestart = false, now = () => Date.now() } = {}) {
+  let checked = 0, recovered = 0, failed = 0, promoted = 0;
+  let runners = [];
+  try { runners = await db.managedRunnersToReconcile(); } catch { return { checked, recovered, failed, promoted }; }
+  for (const r of runners) {
+    if (!r.machineId) continue;
+    checked++;
+    let s;
+    try { s = await driver.status(r.machineId); } catch { continue; }
+    try {
+      if (r.status === "provisioning" && s.state === "ready") {
+        // promote: register the deployment if it isn't already
+        if (!r.deploymentId) {
+          const dep = await db.createDeployment(r.orgId, r.createdBy, { slug: r.slug, harnessId: r.harnessId, targetUrl: s.url || r.url });
+          await db.updateManagedRunner(r.id, { status: "ready", deploymentId: dep.id, url: s.url || r.url, lastHealthAt: now(), detail: null });
+        } else {
+          await db.setDeploymentTarget(r.deploymentId, { targetUrl: s.url || r.url, status: "active" });
+          await db.updateManagedRunner(r.id, { status: "ready", url: s.url || r.url, lastHealthAt: now() });
+        }
+        promoted++;
+      } else if (r.status === "ready" && (s.state === "stopped" || s.state === "error")) {
+        // the machine died under a live runner
+        if (autoRestart) {
+          const rr = await driver.restart(r.machineId);
+          await db.updateManagedRunner(r.id, { status: rr.state === "ready" ? "ready" : "provisioning", url: rr.url || r.url, lastHealthAt: now(), detail: "auto-restarted after crash" });
+          if (rr.state === "ready" && r.deploymentId) await db.setDeploymentTarget(r.deploymentId, { targetUrl: rr.url || r.url, status: "active" });
+          recovered++;
+        } else {
+          if (r.deploymentId) await db.setDeploymentTarget(r.deploymentId, { status: "stopped" });
+          await db.updateManagedRunner(r.id, { status: "error", lastHealthAt: now(), detail: `machine ${s.state}` });
+          failed++;
+        }
+      } else {
+        await db.updateManagedRunner(r.id, { lastHealthAt: now() });
+      }
+    } catch { /* a bad runner must not stall the loop */ }
+  }
+  return { checked, recovered, failed, promoted };
+}
+
+export function startRunnerReconciler(db, { driver, intervalMs = 60_000, autoRestart = false } = {}) {
+  const h = setInterval(() => { reconcileRunners(db, { driver, autoRestart }).catch(() => {}); }, intervalMs);
+  h.unref?.();
+  return () => clearInterval(h);
+}

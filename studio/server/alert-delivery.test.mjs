@@ -73,7 +73,7 @@ await test("deliverTransitions fans out to an org's enabled channels; disabled s
     if (url.includes("c.example")) throw new Error("boom");   // one channel fails
     return { ok: true, status: 200 };
   };
-  const sent = await delivery.deliverTransitions(db, [{ orgId: org.id, state: "firing", message: "m", name: "r", metric: "spend", value: 2 }], { http });
+  const { sent } = await delivery.deliverTransitions(db, [{ orgId: org.id, state: "firing", message: "m", name: "r", metric: "spend", value: 2 }], { http, retries: 0 });
   // attempted 2 enabled (a + c), c failed → 1 successful send; b (disabled) never attempted
   assert.equal(sent, 1);
   assert.ok(calls.some((c) => c.url.includes("a.example")));
@@ -100,10 +100,71 @@ await test("end to end: a firing rule evaluated → delivered to the channel", a
   const transitions = (await evaluateAlerts(db)).filter((t) => t.orgId === org.id);
   assert.equal(transitions.length, 1);
   const { http, calls } = recorder();
-  const sent = await delivery.deliverTransitions(db, transitions, { http });
+  const { sent } = await delivery.deliverTransitions(db, transitions, { http });
   assert.equal(sent, 1);
   assert.equal(calls[0].url, "https://hooks.slack/e2e");
   assert.ok(/FIRING/.test(calls[0].json.text) && /spend high/.test(calls[0].json.text));
+});
+
+await test("deliverToChannel retries with backoff, then succeeds", async () => {
+  let n = 0;
+  const http = async () => { n++; if (n < 3) throw new Error("flaky"); return { ok: true, status: 200 }; };
+  const r = await delivery.deliverToChannel({ type: "webhook", target: "https://x" },
+    { state: "firing", message: "m" }, { http, retries: 3, sleep: async () => {} });
+  assert.equal(r.ok, true);
+  assert.equal(n, 3, "failed twice then succeeded on the third attempt");
+});
+
+await test("deliverToChannel gives up after exhausting retries", async () => {
+  let n = 0;
+  const http = async () => { n++; throw new Error("down"); };
+  await assert.rejects(delivery.deliverToChannel({ type: "webhook", target: "https://x" },
+    { state: "firing" }, { http, retries: 2, sleep: async () => {} }), /down/);
+  assert.equal(n, 3, "initial + 2 retries");
+});
+
+await test("per-rule routing sends only to the rule's named channels", async () => {
+  const org = db.createOrg(alice.id, "Routing");
+  const a = db.createAlertChannel(org.id, alice.id, { type: "webhook", target: "https://a.example/r" });
+  const b = db.createAlertChannel(org.id, alice.id, { type: "webhook", target: "https://b.example/r" });
+  const calls = [];
+  const http = async (m, url) => { calls.push(url); return { ok: true, status: 200 }; };
+  // route a transition to only channel b
+  const out = await delivery.deliverTransitions(db, [{ orgId: org.id, state: "firing", message: "m", channelIds: [b.id] }], { http });
+  assert.equal(out.sent, 1);
+  assert.ok(calls.some((u) => u.includes("b.example")) && !calls.some((u) => u.includes("a.example")));
+  assert.equal(out.results[0].channelId, b.id);
+});
+
+await test("deliverTransitions reports per-channel outcomes (ok + error)", async () => {
+  const org = db.createOrg(alice.id, "Outcomes");
+  db.createAlertChannel(org.id, alice.id, { type: "webhook", target: "https://good.example/o" });
+  db.createAlertChannel(org.id, alice.id, { type: "webhook", target: "https://bad.example/o" });
+  const http = async (m, url) => { if (url.includes("bad")) throw new Error("boom"); return { ok: true, status: 200 }; };
+  const out = await delivery.deliverTransitions(db, [{ orgId: org.id, state: "firing", message: "m" }], { http, retries: 0 });
+  assert.equal(out.sent, 1); assert.equal(out.failed, 1);
+  assert.ok(out.results.find((r) => !r.ok && /boom/.test(r.error)));
+});
+
+await test("cooldown suppresses a re-notify within the window and stamps on send", async () => {
+  const org = db.createOrg(alice.id, "Cooldown");
+  const h = db.saveHarness(alice.id, { id: null, name: "c", graph: { nodes: [], edges: [] }, orgId: org.id });
+  db.createAlertChannel(org.id, alice.id, { type: "webhook", target: "https://cd.example/x" });
+  const rule = db.createAlertRule(org.id, alice.id, { name: "flappy", metric: "spend", comparator: ">", threshold: 0, windowMs: DAY, cooldownMs: 60000 });
+  const calls = [];
+  const http = async () => { calls.push(1); return { ok: true, status: 200 }; };
+  const T0 = 1_000_000;
+  // first firing: delivered + cooldown stamped
+  let out = await delivery.deliverTransitions(db, [{ orgId: org.id, ruleId: rule.id, state: "firing", message: "m", cooldownMs: 60000, lastNotifiedAt: null }], { http, now: () => T0 });
+  assert.equal(out.sent, 1);
+  assert.ok(db.listAlertRules(org.id, alice.id).find((r) => r.id === rule.id).lastNotifiedAt === T0, "cooldown clock stamped");
+  // second firing 30s later with the stamped lastNotifiedAt → suppressed
+  out = await delivery.deliverTransitions(db, [{ orgId: org.id, ruleId: rule.id, state: "firing", message: "m2", cooldownMs: 60000, lastNotifiedAt: T0 }], { http, now: () => T0 + 30000 });
+  assert.equal(out.suppressed, 1); assert.equal(out.sent, 0);
+  assert.equal(calls.length, 1, "no second POST within cooldown");
+  // after the window → delivered again
+  out = await delivery.deliverTransitions(db, [{ orgId: org.id, ruleId: rule.id, state: "firing", message: "m3", cooldownMs: 60000, lastNotifiedAt: T0 }], { http, now: () => T0 + 61000 });
+  assert.equal(out.sent, 1);
 });
 
 console.log(`\nalert-delivery.test.mjs: ${passed} passed, ${failed} failed`);

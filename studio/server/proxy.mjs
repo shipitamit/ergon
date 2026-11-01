@@ -51,6 +51,17 @@ try {
       console.log("[proxy] alert evaluator running.");
     } catch (e) { console.warn(`[proxy] alert evaluator not started: ${e.message}`); }
   }
+  // runner reconciler: liveness-check managed runners (promote healthy, flag crashed)
+  if (process.env.ERGON_HOSTING_DRIVER && process.env.ERGON_RECONCILE !== "off") {
+    try {
+      const { startRunnerReconciler } = await import("./hosting.mjs");
+      const { makeMachinesDriver } = await import("./hosting-driver.mjs");
+      const driver = makeMachinesDriver(process.env.ERGON_HOSTING_DRIVER,
+        { app: process.env.FLY_APP, token: process.env.FLY_API_TOKEN, defaultRegion: process.env.FLY_REGION });
+      startRunnerReconciler(dbmod, { driver, intervalMs: Number(process.env.ERGON_RECONCILE_MS || 60_000), autoRestart: process.env.ERGON_RUNNER_AUTORESTART === "on" });
+      console.log("[proxy] runner reconciler running.");
+    } catch (e) { console.warn(`[proxy] runner reconciler not started: ${e.message}`); }
+  }
 } catch (e) {
   console.log("[proxy] running as pure model proxy (no accounts). To enable them: npm install better-sqlite3 bcryptjs");
 }

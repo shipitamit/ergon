@@ -40,7 +40,8 @@ export async function evaluateAlerts(db, { now = Date.now() } = {}) {
         await db.recordAlertEvent(r.id, r.orgId, { state: evState, value, threshold: r.threshold, message });
         await db.setAlertRuleState(r.id, { state: newState, evaluatedAt: now, triggeredAt: firing ? now : null });
         transitions.push({ ruleId: r.id, orgId: r.orgId, state: evState, value,
-          name: r.name, metric: r.metric, threshold: r.threshold, message, at: now });
+          name: r.name, metric: r.metric, threshold: r.threshold, message, at: now,
+          channelIds: r.channelIds || null, cooldownMs: r.cooldownMs || null, lastNotifiedAt: r.lastNotifiedAt || null });
       } else {
         await db.setAlertRuleState(r.id, { state: newState, evaluatedAt: now });
       }

@@ -95,12 +95,16 @@ const NODE_TYPES = {
             desc: "Branches flow by a rule on the text — no model call. Exports to branch()." },
   parallel: { label: "Parallel", color: "#E6B450", icon: "⑈", ports: ["in", "fan", "out"],
             desc: "Fans the input out to several agents, then joins their results." },
+  guardrail: { label: "Guardrail", color: C.tool, icon: "⛉", ports: ["in", "out"],
+            desc: "Redact PII / moderate / schema-check the text flowing through. Exports to ergon guards." },
+  approval: { label: "Approval", color: "#E6B450", icon: "✋", ports: ["in", "out"],
+            desc: "Pause the run for a person to approve in the inbox before it continues." },
   output: { label: "Output", color: C.output, icon: "▪", ports: ["in"],
             desc: "Where the final answer lands." },
 };
 // NODE_TYPES.color freezes to the dark palette at module load, so a node's accent
 // must be resolved from the CURRENT theme at render time via this map.
-const TYPE_COLOR_KEY = { input: "input", agent: "agent", customtool: "tool", router: "link", conditional: "conditional", parallel: "parallel", output: "output" };
+const TYPE_COLOR_KEY = { input: "input", agent: "agent", customtool: "tool", router: "link", conditional: "conditional", parallel: "parallel", guardrail: "tool", approval: "agent", output: "output" };
 const typeColor = (type) => C[TYPE_COLOR_KEY[type]] || C.agent;
 
 // The port pairs that make a valid edge (sorted-join keys), mirroring
@@ -146,7 +150,7 @@ const QUICK_FIELD = {
   conditional: { field: "rules",       label: "Rules (one per line)",     rows: 4, mono: true  },
   parallel:    { field: "joinPrompt",  label: "Join prompt",              rows: 3, mono: false },
 };
-const hasEditableName = (t) => t === "agent" || t === "customtool" || t === "router" || t === "conditional" || t === "parallel";
+const hasEditableName = (t) => t === "agent" || t === "customtool" || t === "router" || t === "conditional" || t === "parallel" || t === "guardrail";
 
 // deterministic per-user color + initials for collaboration avatars / cursors
 function userColor(key) {
@@ -211,6 +215,16 @@ function defaultConfig(type) {
     joinPrompt: "Combine these parallel results into one coherent answer.",
     provider: "anthropic", model: "claude-sonnet-4-6",
   };
+  if (type === "guardrail") return {
+    name: "guardrail",
+    pii: true,                  // redact emails/phones/cards/SSNs/keys
+    moderation: false,          // block disallowed content
+    schema: "",                 // optional JSON-schema the output must match
+    schemaAction: "flag",       // flag | block
+  };
+  if (type === "approval") return {
+    title: "Approve to continue",   // what the reviewer sees in the inbox
+  };
   return {};
 }
 
@@ -224,7 +238,7 @@ function normalizeImportedGraph(obj) {
   const warnings = [];
   if (!obj || !Array.isArray(obj.nodes) || !Array.isArray(obj.edges))
     throw new Error("Not an Ergon harness (missing nodes/edges arrays).");
-  const validType = (t) => ["input", "agent", "customtool", "output", "router", "conditional", "parallel"].includes(t);
+  const validType = (t) => ["input", "agent", "customtool", "output", "router", "conditional", "parallel", "guardrail", "approval"].includes(t);
   const nodes = obj.nodes.filter((n) => n && n.id && validType(n.type)).map((n) => {
     let config = n.config || {};
     if (n.type === "agent") config = { ...defaultAgentCfg(config.name || "agent"), ...config };
@@ -941,6 +955,8 @@ const NODE_ICON_PATHS = {
   router:      (c) => <><circle cx="5" cy="12" r="1.6" fill={c} stroke="none" /><circle cx="19" cy="5" r="1.6" fill={c} stroke="none" /><circle cx="19" cy="12" r="1.6" fill={c} stroke="none" /><circle cx="19" cy="19" r="1.6" fill={c} stroke="none" /><path d="M6.6 12 17.4 5M6.6 12H17.4M6.6 12 17.4 19" /></>,
   conditional: (c) => <><circle cx="6" cy="5" r="1.8" fill={c} stroke="none" /><circle cx="6" cy="19" r="1.8" fill={c} stroke="none" /><circle cx="18" cy="12" r="1.8" fill={c} stroke="none" /><path d="M6 6.8v10.4M6 12h10.2" /></>,
   parallel:    (c) => <><path d="M4 7h6M4 12h6M4 17h6" /><path d="M10 7c4.5 0 4.5 5 8 5M10 17c4.5 0 4.5-5 8-5M10 12h8" /></>,
+  guardrail:   (c) => <><path d="M12 3l7 3v5c0 4.2-2.9 7.4-7 8.5-4.1-1.1-7-4.3-7-8.5V6z" /><path d="M9 12l2 2 4-4" /></>,
+  approval:    (c) => <><circle cx="12" cy="12" r="8.5" /><path d="M8.5 12.2l2.3 2.3 4.7-4.9" /></>,
   output:      (c) => <><circle cx="12" cy="12" r="8" /><circle cx="12" cy="12" r="2.6" fill={c} stroke="none" /></>,
 };
 const NodeIcon = ({ type, size = 16, color = "currentColor" }) => (
@@ -1463,6 +1479,11 @@ function EvalsModal({ currentOrgId, onClose }) {
     if (runs.length < 2) { setMsg("Need at least two runs to compare."); return; }
     try { setCmp(await cloud.compareEvalRuns(orgId, runs[1].id, runs[0].id)); setMsg(null); } catch (e) { setMsg(e.message); }
   };
+  const runNow = async () => {
+    setMsg("Running…");
+    try { await cloud.runEvalDataset(orgId, sel.id); setRuns(await cloud.evalRuns(orgId, { datasetId: sel.id })); setMsg("Run complete ✓"); }
+    catch (e) { setMsg(e.message); }
+  };
   const pct = (x) => `${Math.round((x || 0) * 100)}%`;
   const when = (ms) => ms ? new Date(ms).toLocaleString() : "—";
 
@@ -1490,6 +1511,7 @@ function EvalsModal({ currentOrgId, onClose }) {
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
               <div style={{ fontWeight: 600, fontSize: 13, flex: 1 }}>{sel.name}</div>
+              {sel.harnessId && <button onClick={runNow} style={pillBtn(C.tool)}>Run now</button>}
               <button onClick={saveCases} style={pillBtn(C.run)}>Save cases</button>
               <button onClick={delDs} style={pillBtn(C.output)}>Delete</button>
             </div>
@@ -2749,6 +2771,21 @@ export default function ErgonStudio() {
       ctx.meter?.(mr.billedModel, mr.usage, c.name);
       return { payload: mr.text };
     }
+    if (nxt.type === "guardrail") {
+      const c = nxt.config || {};
+      let out = payload || "";
+      if (c.pii !== false) {
+        out = out.replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, "[REDACTED:email]")
+                 .replace(/\b(?:\+?\d[ .-]?){10,}\b/g, "[REDACTED:phone]");
+      }
+      log("guardrail", `${c.name || "guardrail"}: preview applies a light PII redact — the exported Python runs the full PII/moderation/schema guards.`);
+      return { payload: out };
+    }
+    if (nxt.type === "approval") {
+      const c = nxt.config || {};
+      log("approval", `${c.title || "Approve to continue"}: preview auto-continues — the exported run pauses here for a person in the Approvals inbox.`);
+      return { payload };
+    }
     if (nxt.type === "output") return { payload, final: true };
     return { payload };
   }
@@ -3234,6 +3271,8 @@ export default function ErgonStudio() {
     { g: "Add", label: "Add Router", kw: "route classify", run: () => { if (simpleMode) toggleSimpleMode(); addNode("router"); } },
     { g: "Add", label: "Add Conditional", kw: "branch if", run: () => { if (simpleMode) toggleSimpleMode(); addNode("conditional"); } },
     { g: "Add", label: "Add Parallel", kw: "fan out", run: () => { if (simpleMode) toggleSimpleMode(); addNode("parallel"); } },
+    { g: "Add", label: "Add Guardrail", kw: "pii moderation schema safety redact", run: () => { if (simpleMode) toggleSimpleMode(); addNode("guardrail"); } },
+    { g: "Add", label: "Add Approval", kw: "human review hitl pause", run: () => { if (simpleMode) toggleSimpleMode(); addNode("approval"); } },
     { g: "Add", label: "Add sticky note", kw: "note comment annotate memo", run: () => addNote() },
     { g: "Run", label: "Run preview", kw: "execute", run: () => run() },
     { g: "Canvas", label: "Tidy layout", kw: "arrange auto align", run: () => tidyLayout() },
@@ -4150,6 +4189,24 @@ export default function ErgonStudio() {
                     </Field>
                   </>)}
                   <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.5 }}>Drag the bottom port to each worker agent. They all receive the same input and run concurrently in the preview.</div>
+                </>); })()}
+
+                {selNode.type === "guardrail" && (() => { const c = selNode.config, u = (patch) => updateConfig(selNode.id, patch); return (<>
+                  <Field label="Guardrail name"><input style={inputStyle} value={c.name || ""} onChange={(e) => u({ name: e.target.value })} /></Field>
+                  <Toggle label="Redact PII" value={c.pii !== false} onChange={(v) => u({ pii: v })} hint="Emails, phones, cards (Luhn), SSNs, IPs, API keys." />
+                  <Toggle label="Content moderation" value={!!c.moderation} onChange={(v) => u({ moderation: v })} hint="Block disallowed content (pattern-based, or a model classifier in code)." />
+                  <Field label="Output JSON schema (optional)"><textarea rows={3} style={{ ...inputStyle, resize: "vertical", fontFamily: MONO }} placeholder='{"type":"object","required":["answer"]}' value={c.schema || ""} onChange={(e) => u({ schema: e.target.value })} /></Field>
+                  <Field label="On schema mismatch">
+                    <select style={inputStyle} value={c.schemaAction || "flag"} onChange={(e) => u({ schemaAction: e.target.value })}>
+                      <option value="flag">Flag (allow through)</option><option value="block">Block (withhold)</option>
+                    </select>
+                  </Field>
+                  <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.5 }}>Sits in the flow between two steps. Preview does a light PII redact; the exported Python runs the full guards.</div>
+                </>); })()}
+
+                {selNode.type === "approval" && (() => { const c = selNode.config, u = (patch) => updateConfig(selNode.id, patch); return (<>
+                  <Field label="What the reviewer sees"><input style={inputStyle} value={c.title || ""} onChange={(e) => u({ title: e.target.value })} /></Field>
+                  <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.5 }}>Pauses the run and files an approval in the inbox; it continues only when a person approves (rejection halts it). Preview auto-continues.</div>
                 </>); })()}
 
                 {selNode.type === "customtool" && (

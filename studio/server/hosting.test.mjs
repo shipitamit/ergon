@@ -150,6 +150,38 @@ await test("a launch failure revokes the just-minted key (no orphaned credential
   assert.equal(after, before, "net live-key count unchanged — the minted key was revoked");
 });
 
+await test("reconcile flags a ready runner whose machine has died (and parks its deployment)", async () => {
+  const driver = new FakeMachinesDriver();
+  const r = await hosting.provision(db, { orgId: team.id, userId: alice.id, harnessId: h.id, slug: "bot-crash" }, { driver });
+  assert.equal(r.status, "ready");
+  driver._m.get(r.machineId).state = "stopped";   // simulate a crash
+  const summary = await hosting.reconcileRunners(db, { driver });
+  assert.ok(summary.failed >= 1);
+  assert.equal(db.getManagedRunner(alice.id, r.id).status, "error");
+  assert.equal(db.resolveDeployment("bot-crash").status, "stopped");
+});
+
+await test("reconcile with autoRestart recovers a crashed runner", async () => {
+  const driver = new FakeMachinesDriver();
+  const r = await hosting.provision(db, { orgId: team.id, userId: alice.id, harnessId: h.id, slug: "bot-recover" }, { driver });
+  driver._m.get(r.machineId).state = "error";
+  const summary = await hosting.reconcileRunners(db, { driver, autoRestart: true });
+  assert.ok(summary.recovered >= 1);
+  assert.equal(db.getManagedRunner(alice.id, r.id).status, "ready");
+  assert.equal(db.resolveDeployment("bot-recover").status, "active");
+});
+
+await test("reconcile promotes a still-provisioning runner that turned ready", async () => {
+  const driver = new FakeMachinesDriver({ readyAfter: 5 });
+  const r = await hosting.provision(db, { orgId: team.id, userId: alice.id, harnessId: h.id, slug: "bot-promote" }, { driver, pollMax: 1 });
+  assert.equal(r.status, "provisioning");
+  driver._m.get(r.machineId).state = "ready";   // it came up
+  const summary = await hosting.reconcileRunners(db, { driver });
+  assert.ok(summary.promoted >= 1);
+  assert.equal(db.getManagedRunner(alice.id, r.id).status, "ready");
+  assert.equal(db.resolveDeployment("bot-promote").status, "active");
+});
+
 await test("FlyMachinesDriver shapes the Machines REST calls correctly (fake transport)", async () => {
   const { FlyMachinesDriver } = await import("./hosting-driver.mjs");
   const calls = [];

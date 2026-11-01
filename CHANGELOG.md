@@ -7,6 +7,42 @@ together (see [Versioning](#versioning)). This project adheres to
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-01
+
+Hardening & completion. Finishes the 0.6.0 trust/ops features and brings the
+guardrail and approval engines onto the canvas: alert delivery gains
+retry/routing/cooldown, observability gains pruning-proof rollups, managed
+hosting gains liveness reconcile, eval gains CI push + run-in-UI, and guardrails
+and approvals become first-class graph nodes.
+
+### Added
+- **Guardrail & approval canvas nodes.** The SDK/server guard + approval engines
+  are now first-class graph nodes: a **Guardrail** node (redact PII / moderate /
+  schema-check, configurable in the inspector) and an **Approval** node (pause
+  for a person) can be dropped into the flow. Codegen emits them into the
+  exported Python (`apply_guards(...)` and `ApprovalClient.from_env()
+  .request_and_wait(...)`, with a `_Text` shim threading the flow), and the
+  in-browser preview handles them (a light PII redact; approval auto-continues
+  with a note that the real run pauses in the inbox).
+- **Eval — CI push + run-in-UI.** The eval read + run-record endpoints now accept
+  an org **API key** (so CI can push scored results); dataset mutation stays
+  signed-in. A **"Run now"** button executes a dataset against the harness's
+  deployed runner (through the same gateway forward) and records the scored run.
+- **Alerting hardening.** Delivery now **retries with backoff** and reports
+  per-channel outcomes; a rule can **route** to specific channels
+  (`channelIds`); and a per-rule **cooldown** (`cooldownMs`) suppresses re-notify
+  while a rule flaps. Both backends.
+- **Observability retention rollups.** Each run is accumulated into a durable
+  per-org **daily rollup** (runs / errors / tokens / cost / avg-latency) at
+  record time, so the long-horizon trend (`GET /api/metrics/rollups`) survives
+  the per-org run-retention prune. Both backends.
+- **Managed-hosting liveness.** Beyond the one-time boot gate, a **reconciler**
+  (`reconcileRunners` / `startRunnerReconciler`) periodically checks each live
+  runner's real machine state: a crashed machine flags the runner and parks its
+  deployment (or auto-restarts when enabled), and a provisioning runner that
+  turned healthy is promoted. *(Infra-gated bits — real Fly log streaming,
+  autoscaling, multi-region, custom domains — remain noted follow-ups.)*
+
 ## [0.6.0] — 2026-11-01
 
 Trust & operations. Rounds out the operability layer on top of 0.5.0's
@@ -246,7 +282,8 @@ code and the runtime in sync. Database changes ship as forward-only migrations
 (`studio/server/migrations.mjs`, currently 0001–0011); newer tables (triggers,
 connections, version history) are also created idempotently at startup.
 
-[Unreleased]: https://example.com/ergon/compare/v0.6.0...HEAD
+[Unreleased]: https://example.com/ergon/compare/v0.7.0...HEAD
+[0.7.0]: https://example.com/ergon/compare/v0.6.0...v0.7.0
 [0.6.0]: https://example.com/ergon/compare/v0.5.0...v0.6.0
 [0.5.0]: https://example.com/ergon/compare/v0.4.0...v0.5.0
 [0.4.0]: https://example.com/ergon/compare/v0.3.0...v0.4.0

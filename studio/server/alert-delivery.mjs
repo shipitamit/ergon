@@ -36,26 +36,48 @@ export function payloadFor(channel, t) {
   };
 }
 
-export async function deliverToChannel(channel, t, { http = defaultHttp } = {}) {
-  return http("POST", channel.target, { json: payloadFor(channel, t) });
+// Deliver to one channel with bounded retry + backoff. Returns {ok, status} or
+// throws after the last attempt.
+export async function deliverToChannel(channel, t, { http = defaultHttp, retries = 2, backoffMs = 200, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try { return await http("POST", channel.target, { json: payloadFor(channel, t) }); }
+    catch (e) { lastErr = e; if (attempt < retries) await sleep(backoffMs * (attempt + 1)); }
+  }
+  throw lastErr;
 }
 
-// Deliver a batch of transitions to each org's enabled channels. Returns the
-// number of successful sends. Channels are loaded once per org.
-export async function deliverTransitions(db, transitions, { http = defaultHttp } = {}) {
-  let sent = 0;
+// Deliver a batch of transitions to each org's enabled channels (honouring a
+// rule's channel_ids routing when set). Best-effort with retry; returns
+// { sent, failed, results:[{ruleId, channelId, ok, error}] }.
+export async function deliverTransitions(db, transitions, { http = defaultHttp, retries = 2, sleep, now = () => Date.now() } = {}) {
+  let sent = 0, failed = 0, suppressed = 0; const results = [];
   const cache = new Map();
   for (const t of transitions || []) {
+    // anti-flap: if this rule notified within its cooldown, skip (don't spam a
+    // channel when a rule flaps ok<->firing rapidly).
+    if (t.cooldownMs && t.lastNotifiedAt && (now() - t.lastNotifiedAt) < t.cooldownMs) {
+      suppressed++; results.push({ ruleId: t.ruleId, suppressed: true }); continue;
+    }
     let channels = cache.get(t.orgId);
     if (channels === undefined) {
       try { channels = await db.enabledAlertChannels(t.orgId); } catch { channels = []; }
       cache.set(t.orgId, channels);
     }
-    for (const ch of channels) {
-      try { await deliverToChannel(ch, t, { http }); sent++; } catch { /* best-effort */ }
+    // per-rule routing: if the rule names channels, only those receive it
+    const targets = (Array.isArray(t.channelIds) && t.channelIds.length)
+      ? channels.filter((c) => t.channelIds.includes(c.id)) : channels;
+    let any = false;
+    for (const ch of targets) {
+      try { await deliverToChannel(ch, t, { http, retries, sleep }); sent++; any = true; results.push({ ruleId: t.ruleId, channelId: ch.id, ok: true }); }
+      catch (e) { failed++; results.push({ ruleId: t.ruleId, channelId: ch.id, ok: false, error: String(e && e.message || e) }); }
+    }
+    // stamp the cooldown clock when we actually notified
+    if (any && t.ruleId && t.cooldownMs && db.markAlertNotified) {
+      try { await db.markAlertNotified(t.ruleId, now()); } catch { /* best-effort */ }
     }
   }
-  return sent;
+  return { sent, failed, suppressed, results };
 }
 
 export async function testChannel(channel, { http = defaultHttp } = {}) {

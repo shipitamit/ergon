@@ -18,6 +18,7 @@ import { forwardRun } from "./gateway.mjs";
 import { fireTrigger } from "./triggers.mjs";
 import { evaluateAlerts } from "./alerts.mjs";
 import { deliverTransitions, testChannel } from "./alert-delivery.mjs";
+import { runDataset } from "./eval-run.mjs";
 import * as hosting from "./hosting.mjs";
 import { makeMachinesDriver } from "./hosting-driver.mjs";
 
@@ -137,7 +138,9 @@ export async function handleApiRoutes(req, res) {
   const isConnResolve = /^\/api\/orgs\/[^/]+\/connections\/[^/]+\/resolve$/.test(p);
   // a deployed runner (API key) files + polls approval requests; it may not decide them
   const isApprovalPath = /^\/api\/orgs\/[^/]+\/approvals(\/[^/]+)?$/.test(p);
-  if (viaKey && !(p.startsWith("/api/harnesses") || p.startsWith("/api/kv") || p.startsWith("/api/runs") || p.startsWith("/api/gw") || isConnResolve || isApprovalPath)) {
+  // CI pushes eval results with an org key (dataset mutation stays human-only, enforced per-route)
+  const isEvalPath = /^\/api\/orgs\/[^/]+\/eval\//.test(p);
+  if (viaKey && !(p.startsWith("/api/harnesses") || p.startsWith("/api/kv") || p.startsWith("/api/runs") || p.startsWith("/api/gw") || isConnResolve || isApprovalPath || isEvalPath)) {
     json(res, 403, { error: "API keys may only access the harness, kv, run, and gateway endpoints." });
     return true;
   }
@@ -320,6 +323,11 @@ export async function handleApiRoutes(req, res) {
         harnessId: url.searchParams.get("harnessId"),
       })), true;
     }
+    if (p === "/api/metrics/rollups" && req.method === "GET") {
+      if (!requireAuth()) return true;
+      const num = (k) => (url.searchParams.get(k) != null ? Number(url.searchParams.get(k)) : null);
+      return json(res, 200, { series: await db.metricsRollupSeries(url.searchParams.get("orgId"), me.id, { from: num("from"), to: num("to") }) }), true;
+    }
 
     // ── organizations (the access model: harness access = org role) ──
     if (p === "/api/orgs" && req.method === "GET") {
@@ -442,7 +450,7 @@ export async function handleApiRoutes(req, res) {
         setAlertRuleState: db.setAlertRuleState,
       }));
       let delivered = 0;
-      try { delivered = await deliverTransitions(db, transitions); } catch { /* best-effort */ }
+      try { delivered = (await deliverTransitions(db, transitions)).sent; } catch { /* best-effort */ }
       return json(res, 200, { transitions, delivered }), true;
     }
     const alertsMatch = p.match(/^\/api\/orgs\/([^/]+)\/alerts$/);
@@ -521,27 +529,35 @@ export async function handleApiRoutes(req, res) {
     }
 
     // ── eval at scale: datasets + stored, scored runs (signed-in) ──
+    // reads + run-record are open to org API keys (CI push); dataset mutation stays human-only.
+    const evalKeyBlock = () => { if (viaKey) { json(res, 403, { error: "Editing eval datasets needs a signed-in person." }); return true; } return false; };
     const evalCompareMatch = p.match(/^\/api\/orgs\/([^/]+)\/eval\/compare$/);
     if (evalCompareMatch && req.method === "GET") {
       if (!requireAuth()) return true;
-      if (viaKey) { json(res, 403, { error: "Evals are a signed-in surface." }); return true; }
       return json(res, 200, { comparison: await db.compareEvalRuns(me.id, url.searchParams.get("a"), url.searchParams.get("b")) }), true;
+    }
+    const evalRunDatasetMatch = p.match(/^\/api\/orgs\/([^/]+)\/eval\/datasets\/([^/]+)\/run$/);
+    if (evalRunDatasetMatch && req.method === "POST") {
+      if (!requireAuth()) return true;
+      const oid = decodeURIComponent(evalRunDatasetMatch[1]);
+      const { label } = await readBody(req);
+      return json(res, 200, { run: await runDataset(db, { orgId: oid, userId: me.id, datasetId: decodeURIComponent(evalRunDatasetMatch[2]), label }, { forward: forwardRun }) }), true;
     }
     const evalDsItemMatch = p.match(/^\/api\/orgs\/([^/]+)\/eval\/datasets\/([^/]+)$/);
     if (evalDsItemMatch) {
       if (!requireAuth()) return true;
-      if (viaKey) { json(res, 403, { error: "Evals are a signed-in surface." }); return true; }
       const did = decodeURIComponent(evalDsItemMatch[2]);
       if (req.method === "GET") return json(res, 200, { dataset: await db.getEvalDataset(me.id, did) }), true;
+      if (evalKeyBlock()) return true;
       if (req.method === "PATCH") return json(res, 200, { dataset: await db.updateEvalDataset(me.id, did, await readBody(req)) }), true;
       if (req.method === "DELETE") return json(res, 200, await db.deleteEvalDataset(me.id, did)), true;
     }
     const evalDsMatch = p.match(/^\/api\/orgs\/([^/]+)\/eval\/datasets$/);
     if (evalDsMatch) {
       if (!requireAuth()) return true;
-      if (viaKey) { json(res, 403, { error: "Evals are a signed-in surface." }); return true; }
       const oid = decodeURIComponent(evalDsMatch[1]);
       if (req.method === "GET") return json(res, 200, { datasets: await db.listEvalDatasets(oid, me.id) }), true;
+      if (evalKeyBlock()) return true;
       if (req.method === "POST") {
         const { name, harnessId, cases } = await readBody(req);
         return json(res, 200, { dataset: await db.createEvalDataset(oid, me.id, { name, harnessId, cases }) }), true;
@@ -550,13 +566,11 @@ export async function handleApiRoutes(req, res) {
     const evalRunItemMatch = p.match(/^\/api\/orgs\/([^/]+)\/eval\/runs\/([^/]+)$/);
     if (evalRunItemMatch && req.method === "GET") {
       if (!requireAuth()) return true;
-      if (viaKey) { json(res, 403, { error: "Evals are a signed-in surface." }); return true; }
       return json(res, 200, { run: await db.getEvalRun(me.id, decodeURIComponent(evalRunItemMatch[2])) }), true;
     }
     const evalRunsMatch = p.match(/^\/api\/orgs\/([^/]+)\/eval\/runs$/);
     if (evalRunsMatch) {
       if (!requireAuth()) return true;
-      if (viaKey) { json(res, 403, { error: "Evals are a signed-in surface." }); return true; }
       const oid = decodeURIComponent(evalRunsMatch[1]);
       if (req.method === "GET") return json(res, 200, { runs: await db.listEvalRuns(oid, me.id, { datasetId: url.searchParams.get("datasetId") || null }) }), true;
       if (req.method === "POST") {
