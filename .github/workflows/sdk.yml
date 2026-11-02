@@ -1,0 +1,43 @@
+name: SDK
+
+on:
+  push:
+    paths: ["sdk/**", ".github/workflows/sdk.yml"]
+  pull_request:
+    paths: ["sdk/**", ".github/workflows/sdk.yml"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (editable)
+        run: python -m pip install -e .
+      - name: Byte-compile every module
+        run: python -m compileall ergon
+      - name: Import smoke test
+        # The SDK's providers are optional deps; importing the package and the
+        # public API must work without anthropic/openai installed.
+        run: |
+          python - <<'PY'
+          import ergon as af
+          for name in ("Agent", "ApprovalPolicy", "BrowserSession", "browser_tools",
+                       "evaluate", "load_harness", "chain", "route", "parallel",
+                       "CancelToken", "Usage", "tool",
+                       "resolve", "Router", "Deployment", "register_cost", "known_providers"):
+              assert hasattr(af, name), f"missing public export: {name}"
+          print("public API present:", len(af.__all__), "exports")
+          PY
+      - name: Run test suite
+        run: |
+          python -m pip install pytest
+          python -m pytest tests/ -v

@@ -8,10 +8,17 @@ what is built versus a process the operator still owns.
 
 ## Reporting a vulnerability
 
-Email the maintainers (see the repository's contact in `README.md`) with a
-description, reproduction steps, and impact. Please do not open a public issue
-for a security report. We aim to acknowledge within a few business days and to
-coordinate a fix and disclosure timeline with you.
+**Please do not open a public issue for a security report.** Instead, report it
+privately through GitHub Security Advisories:
+
+> [**Report a vulnerability**](https://github.com/shipitamit/ergon/security/advisories/new)
+> — github.com/shipitamit/ergon → **Security** tab → **Report a vulnerability**
+
+This keeps the report confidential between you and the maintainers until a fix
+is released. Include a description, reproduction steps, and the impact you see.
+
+We aim to acknowledge within a few business days and to coordinate a fix and a
+disclosure timeline with you.
 
 ## What the tier is built with
 

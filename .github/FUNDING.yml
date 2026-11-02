@@ -1,0 +1,14 @@
+# Drives the "Sponsor" button on the repo. Uncomment a line and fill in your
+# real handle once the account exists — a placeholder would link to a dead page,
+# so everything is commented out until then (no button shows, which is correct).
+#
+# Docs: https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+
+# github: [shipitamit]                # GitHub Sponsors — 1–4 user/org handles
+# open_collective: ergon              # https://opencollective.com/ergon
+# ko_fi: ergon                        # https://ko-fi.com/ergon
+# buy_me_a_coffee: ergon              # https://buymeacoffee.com/ergon
+# liberapay: ergon                    # https://liberapay.com/ergon
+# patreon: ergon                      # https://patreon.com/ergon
+# tidelift: pypi/ergon                # platform-name/package-name
+# custom: ["https://ergon.dev/sponsor"]   # any other URL(s)

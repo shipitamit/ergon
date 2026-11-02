@@ -1,0 +1,47 @@
+name: Postgres integration
+
+# Verifies the Studio data layer against a REAL Postgres (pgvector), not just
+# the offline fake-pool parity. Boots a Postgres service container and runs the
+# end-to-end smoke in studio/server/pg_smoke.mjs.
+
+on:
+  push:
+    paths: ["studio/server/**", ".github/workflows/pg-it.yml"]
+  pull_request:
+    paths: ["studio/server/**", ".github/workflows/pg-it.yml"]
+
+jobs:
+  pg-integration:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: studio
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ergon
+          POSTGRES_PASSWORD: ergon
+          POSTGRES_DB: ergon
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ergon"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://ergon:ergon@localhost:5432/ergon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+      - name: Install (pg driver needed for the live wire)
+        run: (npm ci || npm install) && npm install pg
+      - name: Apply migrations on real Postgres
+        run: npm run migrate
+      - name: End-to-end smoke on real Postgres
+        run: node server/pg_smoke.mjs

@@ -149,6 +149,33 @@ The SDK and Studio share one version and release together — a change usually
 touches both, so lockstep releases keep the generated code and the runtime in
 sync. Tags are `vMAJOR.MINOR.PATCH` at the repo root.
 
+## Supporting Ergon
+
+Ergon is open source and built in the open. The most valuable support isn't
+money — it's signal that the project is used and worth maintaining:
+
+- **Star the repo.** It's the clearest signal of interest and helps others find
+  Ergon.
+- **Join the discussion.** Ask questions, share what you built, or float an idea
+  in [Discussions](../../discussions) — answering someone else's question counts
+  just as much.
+- **Use it and tell us what broke.** A good bug report with a minimal repro is
+  worth more than a dozen vague ones — file it with the
+  [bug template](.github/ISSUE_TEMPLATE/bug_report.md).
+- **Improve the docs.** Found something wrong or unclear? Open a
+  [docs issue](.github/ISSUE_TEMPLATE/documentation.md) or send a PR — small doc
+  fixes are the easiest first contribution.
+- **Contribute code.** Pick up a `good first issue`, or propose a change first
+  via a [feature request](.github/ISSUE_TEMPLATE/feature_request.md). See
+  [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, tests, and the PR flow.
+- **Write about it.** A blog post, a talk, or an example harness showing what
+  you built helps more people than you'd expect.
+- **Sponsor.** If Ergon saves you time and you want to fund its upkeep, see the
+  **Sponsor** button at the top of the repo (configured in
+  [.github/FUNDING.yml](.github/FUNDING.yml)).
+
+By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
 See [LICENSE](LICENSE).

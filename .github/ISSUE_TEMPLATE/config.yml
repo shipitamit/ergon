@@ -1,0 +1,9 @@
+# Issue chooser shown at github.com/shipitamit/ergon/issues/new/choose
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Question / discussion
+    url: https://github.com/shipitamit/ergon/discussions
+    about: Ask how to do something, or float an idea before filing an issue.
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/shipitamit/ergon/security/advisories/new
+    about: Report privately via GitHub Security Advisories — never open a public issue.

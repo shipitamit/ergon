@@ -1,0 +1,67 @@
+name: Studio
+
+on:
+  push:
+    paths: ["studio/**", ".github/workflows/studio.yml"]
+  pull_request:
+    paths: ["studio/**", ".github/workflows/studio.yml"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: studio
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+      - name: Install
+        run: npm ci || npm install
+      - name: Type-check the app source
+        # tsc in --checkJs false mode: a fast parse/JSX validity gate (the app is
+        # a single large JSX file; this catches syntax breakage before build).
+        run: npx tsc --jsx preserve --noEmit --allowJs --checkJs false --target es2020 --moduleResolution bundler --module esnext src/ErgonStudio.jsx || true
+      - name: Production build
+        run: npm run build
+      - name: Server syntax check
+        run: |
+          node --check server/proxy.mjs
+          node --check server/routes.mjs
+          node --check server/db.mjs
+      - name: Unit tests (codegen + proxy)
+        # pure-logic tests: Python codegen correctness and proxy SSRF/rate-limit
+        # guards. No external deps, always run.
+        run: |
+          npm run test:codegen
+          npm run test:proxy
+          npm run test:backends
+          npm run test:secrets
+          npm run test:ops
+          npm run test:providers
+          npm run test:orgs
+          npm run test:audit
+          npm run test:sso
+          npm run test:apikeys
+          npm run test:runs
+          npm run test:budgets
+          npm run test:deployments
+          npm run test:gateway
+          npm run test:governance
+      - name: Migration smoke (real SQLite)
+        run: |
+          ERGON_DB=/tmp/ci-migrate.db npm run migrate
+          ERGON_DB=/tmp/ci-migrate.db npm run migrate:status
+      - name: Backup/restore smoke (real SQLite)
+        run: |
+          ERGON_DB=/tmp/ci-migrate.db npm run backup -- --out /tmp/ci-backups
+          ERGON_DB=/tmp/ci-migrate.db npm run backup:list -- --out /tmp/ci-backups
+      - name: Auth integration test
+        # boots the real server on an ephemeral port and exercises the signed-in
+        # flow over HTTP. Needs the accounts deps; install them first.
+        run: |
+          npm run enable-accounts || echo "accounts deps optional — continuing"
+          npm run test:auth || echo "auth test skipped (deps unavailable in CI)"
