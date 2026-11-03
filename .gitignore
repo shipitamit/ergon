@@ -32,11 +32,15 @@ yarn-error.log*
 *.pem
 
 # ── runtime / generated (never commit) ──
-sessions/               # SDK session output (history.json, events.jsonl)
-workspace/              # agent working dirs (files/shell tools)
-backups/                # DB backup snapshots
+# SDK session output (history.json, events.jsonl)
+sessions/
+# agent working dirs (files/shell tools)
+workspace/
+# DB backup snapshots
+backups/
 *.pre-restore-*
 *.log
+
 # SQLite (accounts tier) — any location
 *.db
 *.db-shm

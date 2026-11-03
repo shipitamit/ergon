@@ -7,6 +7,25 @@ together (see [Versioning](#versioning)). This project adheres to
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-11-02
+
+Release & packaging. No SDK or Studio runtime changes: this release makes the
+SDK installable from PyPI and prepares the repository for public contribution.
+
+### Added
+- **PyPI packaging.** The SDK is published to PyPI as `ergon-ai` (imported as
+  `ergon`). `pyproject.toml` gains a long description, project URLs, trove
+  classifiers, and keywords, and now ships only the `ergon` package.
+- **Automated publishing.** A tag-triggered GitHub Actions workflow builds and
+  publishes the SDK to PyPI via Trusted Publishing (OIDC, no stored token).
+- **Community health files.** Issue chooser, a documentation issue template, a
+  `FUNDING.yml` placeholder, a "Supporting Ergon" README section, and private
+  vulnerability reporting through GitHub Security Advisories.
+
+### Changed
+- Repository metadata and changelog links now point at
+  `github.com/shipitamit/ergon`.
+
 ## [0.7.0] — 2026-11-01
 
 Hardening & completion. Finishes the 0.6.0 trust/ops features and brings the
@@ -282,7 +301,8 @@ code and the runtime in sync. Database changes ship as forward-only migrations
 (`studio/server/migrations.mjs`, currently 0001–0011); newer tables (triggers,
 connections, version history) are also created idempotently at startup.
 
-[Unreleased]: https://github.com/shipitamit/ergon/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/shipitamit/ergon/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/shipitamit/ergon/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/shipitamit/ergon/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/shipitamit/ergon/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/shipitamit/ergon/compare/v0.4.0...v0.5.0
