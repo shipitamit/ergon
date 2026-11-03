@@ -393,7 +393,8 @@ def test_elicitation_decline_and_accept():
         assert a1 == "decline"
         accept = _make_elicitation_callback(lambda m, s: {"name": "alice"})
         r2 = await accept(None, type("P", (), {"message": "n?", "requestedSchema": {}})())
-        assert getattr(r2, "action", None) == "accept"
+        a2 = getattr(r2, "action", None) or (r2.get("action") if isinstance(r2, dict) else None)
+        assert a2 == "accept"
     asyncio.run(run())
 
 

@@ -552,15 +552,19 @@ def _make_elicitation_callback(handler):
                 result = await result
         except Exception:
             result = None
+        # Normalize the handler result into (action, optional content).
+        if result in (None, False):
+            action, content = "decline", None
+        elif result is True:
+            action, content = "accept", {}
+        else:
+            action, content = "accept", dict(result)
         try:
             from mcp.types import ElicitResult
         except ImportError:
-            return {"action": "decline"}
-        if result in (None, False):
-            return ElicitResult(action="decline")
-        if result is True:
-            return ElicitResult(action="accept", content={})
-        return ElicitResult(action="accept", content=dict(result))
+            # mcp SDK not installed (zero-dep path): mirror ElicitResult as a plain dict.
+            return {"action": action} if content is None else {"action": action, "content": content}
+        return ElicitResult(action=action) if content is None else ElicitResult(action=action, content=content)
     return _callback
 
 
