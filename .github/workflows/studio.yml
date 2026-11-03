@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"   # >= 22 for the built-in node:sqlite fallback
           cache: npm
           cache-dependency-path: studio/package-lock.json
       - name: Install
