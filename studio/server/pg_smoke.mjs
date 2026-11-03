@@ -23,7 +23,7 @@ await db.init(url);                        // creates the schema (CREATE TABLE I
 let passed = 0;
 const step = async (name, fn) => { await fn(); passed++; console.log(`  ✓ ${name}`); };
 
-const uniq = `pg_${Date.now()}`;
+const uniq = `pg-${Date.now()}`;   // hyphen, not underscore: reused in the deployment slug, which only allows [a-z0-9-]
 const email = `${uniq}@example.com`;
 
 try {
