@@ -1,6 +1,6 @@
 # Ergon SDK
 
-> Part of the [Ergon monorepo](../README.md) — this is the `sdk/`
+> Part of the [Ergon monorepo](https://github.com/shipitamit/ergon/blob/main/README.md) — this is the `sdk/`
 > subproject. Run the commands below from this directory (`cd sdk`), or use the
 > repo-root bootstrap script.
 
@@ -10,14 +10,25 @@ behind Ergon Studio (the drag-and-drop builder). Design a harness
 visually in the Studio and export it as code against this SDK, or write it
 by hand.
 
+## Install
+
 ```bash
-# from this directory (the package is distributed as source, not on PyPI):
-pip install -e .                  # installs ergon + the anthropic core dep
-pip install -e ".[openai]"        # + OpenAI-compatible providers (optional)
-pip install -e ".[gemini]"        # + Google Gemini (optional)
-pip install -e ".[bedrock]"       # + AWS Bedrock (optional)
-pip install -e ".[otel]"          # + OpenTelemetry (optional)
-export ANTHROPIC_API_KEY=sk-ant-...   # and/or OPENAI_API_KEY, GEMINI_API_KEY, AWS creds
+pip install ergon-ai                    # core: the SDK + the Anthropic provider
+pip install "ergon-ai[openai]"          # + OpenAI-compatible providers
+pip install "ergon-ai[gemini]"          # + Google Gemini
+pip install "ergon-ai[bedrock]"         # + AWS Bedrock
+pip install "ergon-ai[rag,browser]"     # + retrieval and browser control
+export ANTHROPIC_API_KEY=sk-ant-...     # and/or OPENAI_API_KEY, GEMINI_API_KEY, AWS creds
+```
+
+The package installs as `ergon-ai`, but you import it as `ergon`. On a machine
+with more than one Python or a virtualenv, use `python -m pip install ergon-ai`
+to install into the interpreter you expect.
+
+For local development against a checkout, install it editable from `sdk/`:
+
+```bash
+pip install -e ".[dev]"                 # editable install + test deps (run from sdk/)
 ```
 
 ```python
@@ -251,7 +262,7 @@ Turn a harness into a long-running service with a small, native REST + SSE
 interface (no OpenAI-compatible shim):
 
 ```bash
-pip install ergon
+pip install ergon-ai
 export ERGON_SERVE_KEY="$(openssl rand -hex 16)"       # optional bearer key
 ergon serve harness.json --host 0.0.0.0 --port 8900 --auth-key "$ERGON_SERVE_KEY"
 ```
@@ -693,7 +704,7 @@ kb.add_path("docs/")                       # every supported file in a folder
 ```
 
 `retrieve_tool(kb, k=4)` is safe (read-only), returning the top-k passages with
-scores and source tags. Extras: `pip install ergon[rag]` (embeddings) and
+scores and source tags. Extras: `pip install ergon-ai[rag]` (embeddings) and
 `ergon[pgvector]` (Postgres).
 
 Every adapter is **unit-tested offline** against a deterministic fake embedder, a
@@ -841,7 +852,7 @@ capabilities, shaped for an autonomous agent:
   there's no human to answer. (Elicitation suits interactive hosts more than an
   autonomous agent; the handler is the seam for when a person is present.)
 
-Needs the `mcp` package: `pip install ergon[mcp]`.
+Needs the `mcp` package: `pip install ergon-ai[mcp]`.
 
 ## Browser control
 
@@ -888,7 +899,7 @@ credentials, and a hostile page is a prompt-injection surface (page text like
 Playwright is an optional dependency:
 
 ```bash
-pip install ergon[browser]
+pip install ergon-ai[browser]
 playwright install chromium
 ```
 

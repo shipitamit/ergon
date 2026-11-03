@@ -421,7 +421,7 @@ the act-tools — leave it off unless the agent only visits trusted sites.
   + downloads Chromium). Without it, browser calls return a clear "install
   Playwright" message instead of failing. Sessions are per-run and auto-expire.
 - **Exported Python (SDK)** — yes, via `BrowserSession` + `browser_tools`
-  (`pip install ergon[browser]`; `playwright install chromium`).
+  (`pip install ergon-ai[browser]`; `playwright install chromium`).
 - **Claude artifact** — export-only (no server to launch a browser).
 
 Navigation is SSRF-guarded (internal/loopback hosts blocked) in both the proxy

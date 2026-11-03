@@ -169,7 +169,7 @@ gh release create v0.7.0 ergon-v0.7.0.zip \
 
 - [ ] CI is green on the pushed tag (`.github/workflows/sdk.yml`,
       `studio.yml`, `pg-it.yml`).
-- [ ] Smoke-test the published artifact: `pip install ergon` (or the wheel) in a
+- [ ] Smoke-test the published artifact: `pip install ergon-ai` (or the wheel) in a
       clean venv, `python -c "import ergon; print(ergon.__version__)"`.
 - [ ] Update `ergon-vs-market.xlsx` roadmap statuses if the release changed any.
 
