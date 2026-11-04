@@ -3804,7 +3804,9 @@ export default function ErgonStudio() {
             {nodes.map((n) => {
               const m = NODE_TYPES[n.type], sel = selected === n.id || multiSel.has(n.id), pp = portPos(n);
               const issueLevel = nodeIssue[n.id];
-              const title = n.type === "agent" || n.type === "customtool" ? n.config.name : m.label;
+              const title = n.type === "approval" ? (n.config.title || m.label)
+                : hasEditableName(n.type) ? (n.config.name || m.label)
+                : m.label;
               const routerChips = n.type === "router" ? (n.config.labels || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 4)
                 : n.type === "conditional" ? (() => { const p = parseConditions(n.config.rules); return [...p.rules.map((r) => r.label), ...(p.elseLabel ? [p.elseLabel] : [])].slice(0, 4); })()
                 : n.type === "parallel" ? [n.config.join ? "join" : "concat"] : [];
