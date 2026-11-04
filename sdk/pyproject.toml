@@ -1,6 +1,6 @@
 [project]
 name = "ergon-ai"
-version = "0.7.1"
+version = "0.7.2"
 description = "Batteries-included harness for building AI agents (Anthropic, OpenAI-compatible, Ollama, Gemini, Bedrock): tool loops, persistence, compaction, approval, streaming, eval, browser control."
 readme = "README.md"
 requires-python = ">=3.9"

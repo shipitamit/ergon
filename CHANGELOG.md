@@ -7,6 +7,14 @@ together (see [Versioning](#versioning)). This project adheres to
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-11-03
+
+Patch release. CI hardening. No public API changes.
+
+### Changed
+- CI: the PyPI publish job grants `contents: read` (private-repo checkout) and
+  uses `skip-existing` so re-runs don't fail on an already-published version.
+
 ## [0.7.1] — 2026-11-02
 
 Release & packaging. No SDK or Studio runtime changes: this release makes the
@@ -301,7 +309,8 @@ code and the runtime in sync. Database changes ship as forward-only migrations
 (`studio/server/migrations.mjs`, currently 0001–0011); newer tables (triggers,
 connections, version history) are also created idempotently at startup.
 
-[Unreleased]: https://github.com/shipitamit/ergon/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/shipitamit/ergon/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/shipitamit/ergon/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/shipitamit/ergon/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/shipitamit/ergon/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/shipitamit/ergon/compare/v0.5.0...v0.6.0
